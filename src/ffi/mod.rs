@@ -269,11 +269,18 @@ impl OnlineRecognizer {
             if result.is_null() {
                 return String::new();
             }
-            let text_ptr = (*result).text;
-            let text = if text_ptr.is_null() {
-                String::new()
-            } else {
-                CStr::from_ptr(text_ptr).to_string_lossy().to_string()
+            // 关键：在 destroy result 之前先把 text 拷成 owned String。
+            // sherpa-onnx 的 `text` 指针指向 result 内部 buffer；release + LTO 下
+            // `to_string_lossy().to_string()` 容易被优化成延迟拷贝，destroy 之后再
+            // 解引用 -> 段错误。这里把 to_string_lossy 的生命周期收敛在 result 存活
+            // 的作用域内并用 into_owned() 强制落地，可彻底规避。
+            let text = {
+                let text_ptr = (*result).text;
+                if text_ptr.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(text_ptr).to_string_lossy().into_owned()
+                }
             };
             SherpaOnnxDestroyOnlineRecognizerResult(result);
             text
@@ -295,6 +302,9 @@ impl OnlineRecognizer {
         false
     }
 
+    /// 重新创建流以绕开 sherpa-onnx 1.12.9 reset 路径下的状态损坏。
+    /// 推荐在 endpoint 后调用 `create_stream` 重建流，而不是调用 `reset`。
+    #[allow(dead_code)]
     pub fn reset(&self, stream: &mut OnlineStream) {
         unsafe {
             SherpaOnnxOnlineStreamReset(stream.stream);

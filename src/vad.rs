@@ -63,6 +63,21 @@ impl EndpointDetector {
         self.silence_samples = 0;
         self.speech_samples = 0;
     }
+
+    /// 当前已采样的采样率。日志里用它把 samples 数转毫秒。
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// 累计的语音样本数（reset 后从 0 累加）。
+    pub fn speech_samples(&self) -> u32 {
+        self.speech_samples
+    }
+
+    /// 累计的静音样本数（reset 后从 0 累加）。
+    pub fn silence_samples(&self) -> u32 {
+        self.silence_samples
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ ctrlc = "3.4"
 arboard = "3.4"
 evdev = "0.12"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 egui = "0.30"
 eframe = { version = "0.30", default-features = false, features = ["wayland", "glow"] }
