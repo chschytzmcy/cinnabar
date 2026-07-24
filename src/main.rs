@@ -842,17 +842,19 @@ fn combined_score(streaming: &str, refined: &str) -> f32 {
 
 /// refine 决策阈值（基于 combined_score，0-1 之间）。
 ///
-/// 阈值选择依据：实测 session-20260724-031655 / -032827 / -040135：
+/// 阈值选择依据：实测多段会话：
 /// - 完全一致 → 1.0 → override
-/// - 末尾补 1-2 字：score 0.85-0.95 → override
-/// - 短文本词替换：score 0.5-0.75 → override_warn
+/// - 末尾补 1-2 字：score 0.92-1.0 → override
+/// - 同音字错（如"也"→"冷"、"当年"→"多年"）：score 0.62-0.79 → 应 rejected（之前 0.85 阈值会误判 override）
 /// - 丢前缀 / 整段重写：score 0.0-0.4 → rejected
-const REFINE_HIGH_THRESHOLD: f32 = 0.85;
+///
+/// HIGH 阈值 0.92：宁可严苛一些，避免"jaccard 高但 prefix_match 漏掉中部错字"的情况漏过。
+const REFINE_HIGH_THRESHOLD: f32 = 0.92;
 const REFINE_MED_THRESHOLD: f32 = 0.40;
 
 /// 三档决策：
-/// - `"override"`        — combined_score >= 0.85，精修与流式结构相似 + 前缀一致 + 长度相近
-/// - `"override_warn"`   — 0.40 <= score < 0.85，部分一致，覆盖但日志标 warn
+/// - `"override"`        — combined_score >= 0.92，精修与流式结构高度一致
+/// - `"override_warn"`   — 0.40 <= score < 0.92，部分一致，覆盖但日志标 warn
 /// - `"rejected"`        — score < 0.40，差异过大（丢前缀 / 整体重写），保留流式结果
 fn refine_decision(score: f32) -> &'static str {
     if score >= REFINE_HIGH_THRESHOLD {
@@ -998,9 +1000,9 @@ mod tests {
 
     #[test]
     fn refine_decision_boundaries() {
-        // 综合分阈值：0.85 / 0.40
-        assert_eq!(refine_decision(0.85), "override");
-        assert_eq!(refine_decision(0.849), "override_warn");
+        // 综合分阈值：0.92 / 0.40
+        assert_eq!(refine_decision(0.92), "override");
+        assert_eq!(refine_decision(0.919), "override_warn");
         assert_eq!(refine_decision(0.40), "override_warn");
         assert_eq!(refine_decision(0.399), "rejected");
         assert_eq!(refine_decision(1.0), "override");
