@@ -52,11 +52,9 @@ offline_model_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.onnx"
 offline_tokens_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt"
 
 # 热词文件（每行一个词或短语）；空字符串 = 关闭
-# hotwords.txt 示例：
-#   cinnabar
-#   sherpa-onnx
-#   端到端
-offline_hotwords_file = ""
+# 仓库自带 docs/hotword.md（人名/地名/品牌/公司名）
+# 格式：纯 UTF-8 文本，每行一个热词，# 开头为注释
+offline_hotwords_file = "./docs/hotword.md"
 offline_hotwords_score = 1.5  # 0.0-2.0 范围
 
 # onnxruntime 推理线程数（Zipformer CTC 单线程也快，2 够用）

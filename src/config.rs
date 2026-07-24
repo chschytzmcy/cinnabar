@@ -97,8 +97,9 @@ fn default_offline_tokens_path() -> String {
 }
 
 /// 热词文件路径；空字符串表示关闭热词功能
+/// 默认指向 `docs/hotword.md`（仓库自带的人名/地名/公司名热词清单）
 fn default_offline_hotwords_file() -> String {
-    "".to_string()
+    "./docs/hotword.md".to_string()
 }
 
 /// 热词加成权重 0.0-2.0 范围；0.0 关闭，1.0 中等，2.0 强烈
@@ -207,7 +208,8 @@ mod tests {
         assert_eq!(c.offline_num_threads, 2);
         assert_eq!(c.offline_provider, "cpu");
         assert_eq!(c.offline_decoding, "greedy_search");
-        assert_eq!(c.offline_hotwords_file, "");
+        // 默认热词文件指向仓库自带的 docs/hotword.md
+        assert!(c.offline_hotwords_file.ends_with("hotword.md"));
         assert_eq!(c.offline_hotwords_score, 1.5);
         assert!(c.enable_offline_refine);
     }
