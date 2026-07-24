@@ -1,7 +1,16 @@
 # Cinnabar 配置文件示例
 # 任何字段都可以省略，serde 会用各字段的默认函数回填。
 
-# 模型目录路径（包含 ASR encoder/decoder ONNX 与 tokens.txt）
+# 模型目录路径：
+#   ./models/sherpa-onnx-x-asr-960ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05/
+#     ├── encoder.int8.onnx       (流式 Zipformer transducer encoder, int8)
+#     ├── decoder.onnx            (流式 decoder, int8 命名未带 .int8)
+#     ├── joiner.int8.onnx        (流式 joiner, int8)
+#     └── tokens.txt              (流式 tokens)
+#   ./models/ten-vad.onnx
+#   ./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/
+#     ├── model.int8.onnx         (非流式 Zipformer CTC, 用于精修)
+#     └── tokens.txt
 model_dir = "./models"
 
 # ===== ten-vad 配置 =====
@@ -35,9 +44,20 @@ vad_provider = "cpu"
 # 精修整段音频，~200ms 内覆盖该行。纯流式 → 把 enable_offline_refine
 # 设为 false 即可，命令行 --no-offline-refine 也能临时关。
 
-# 离线 Zipformer CTC 模型（中文 int8，AISHELL WER 1.74%）
-offline_model_path = "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx"
-offline_tokens_path = "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt"
+# 离线 Paraformer（中文 attention decoder，原生支持热词加成，223MB int8）
+# 选 Paraformer 而非 Zipformer CTC / SenseVoice：
+#   - attention decoder 在 beam search 阶段对热词加权（CTC 框架弱，SenseVoice 不支持）
+#   - 不会过度摘要（与之前用的 Zipformer CTC 不同）
+offline_model_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.onnx"
+offline_tokens_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt"
+
+# 热词文件（每行一个词或短语）；空字符串 = 关闭
+# hotwords.txt 示例：
+#   cinnabar
+#   sherpa-onnx
+#   端到端
+offline_hotwords_file = ""
+offline_hotwords_score = 1.5  # 0.0-2.0 范围
 
 # onnxruntime 推理线程数（Zipformer CTC 单线程也快，2 够用）
 offline_num_threads = 2

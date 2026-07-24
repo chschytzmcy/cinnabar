@@ -184,12 +184,31 @@ fn main() -> Result<()> {
         anyhow::bail!("未找到模型目录：{}", args.model_dir.display());
     }
 
-    let recognizer = OnlineRecognizer::new(
-        &args.model_dir.join("encoder.int8.onnx").to_string_lossy(),
-        &args.model_dir.join("decoder.int8.onnx").to_string_lossy(),
-        &args.model_dir.join("tokens.txt").to_string_lossy(),
-        4,
-    )?;
+    // 流式 ASR 模型：Zipformer transducer（127MB, 中英双语 + 内置标点）
+let stream_subdir = "sherpa-onnx-x-asr-960ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05";
+let recognizer = OnlineRecognizer::new(
+    &args
+        .model_dir
+        .join(stream_subdir)
+        .join("encoder.int8.onnx")
+        .to_string_lossy(),
+    &args
+        .model_dir
+        .join(stream_subdir)
+        .join("decoder.onnx")
+        .to_string_lossy(),
+    &args
+        .model_dir
+        .join(stream_subdir)
+        .join("joiner.int8.onnx")
+        .to_string_lossy(),
+    &args
+        .model_dir
+        .join(stream_subdir)
+        .join("tokens.txt")
+        .to_string_lossy(),
+    4,
+)?;
 
     let mut stream = recognizer.create_stream();
 
@@ -316,19 +335,36 @@ fn main() -> Result<()> {
         .build()
         .context("创建 ten-vad VoiceActivityDetector 失败（检查 --vad-model 路径）")?;
 
-    // 非流式 ASR（Zipformer CTC 中文 int8）：用于切段后的精修。
+    // 非流式 ASR（Paraformer zh attention decoder）：用于切段后的精修。
     // 加载失败 / 配置关闭时为 None，主循环里跳过 refine 走纯流式。
+    // 空字符串的 hotwords_file 表示不启用热词。
     let offline: Option<OfflineRecognizer> = if enable_offline_refine {
+        let hw_file = if file_config.offline_hotwords_file.is_empty() {
+            None
+        } else {
+            Some(file_config.offline_hotwords_file.as_str())
+        };
         match OfflineRecognizer::new(
             &offline_model_path,
             &offline_tokens_path,
             offline_num_threads,
             &offline_provider,
             &offline_decoding,
+            hw_file,
+            file_config.offline_hotwords_score,
         ) {
             Ok(r) => {
+                let hw_info = if hw_file.is_some() {
+                    format!(
+                        "，热词加成 {:.1}",
+                        file_config.offline_hotwords_score
+                    )
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "🔧 非流式 ASR 已加载（Zipformer CTC，refine 开启；~+200ms 延迟）"
+                    "🔧 非流式 ASR 已加载（Paraformer，refine 开启；~+200ms 延迟{}）",
+                    hw_info
                 );
                 Some(r)
             }
@@ -607,12 +643,13 @@ fn main() -> Result<()> {
 /// - `\x1b[2K`：擦除整行（包括光标右侧所有字符），保证新文本较短时不会残留
 /// - `▌ {text}`：左侧细条 + 文本，是常见的"流式中"前缀符号
 fn print_partial(text: &str, tty: bool) {
+    let compact = strip_display_spaces(text);
     if tty {
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "\r\x1b[2K▌ {}", text);
+        let _ = write!(out, "\r\x1b[2K▌ {}", compact);
         let _ = out.flush();
     } else {
-        println!("{}", text);
+        println!("{}", compact);
     }
 }
 
@@ -620,12 +657,13 @@ fn print_partial(text: &str, tty: bool) {
 /// 这样下一句 partial 会从新行开始，避免 partial 与 final 串行错位。
 /// piped 下保留 `\n✅ ` 前缀风格，让 grep / awk 等下游工具更易识别。
 fn print_final(text: &str, tty: bool) {
+    let compact = strip_display_spaces(text);
     if tty {
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "\r\x1b[2K✅ {}\n", text);
+        let _ = write!(out, "\r\x1b[2K✅ {}\n", compact);
         let _ = out.flush();
     } else {
-        println!("\n✅ {}", text);
+        println!("\n✅ {}", compact);
     }
 }
 
@@ -640,14 +678,33 @@ fn print_final(text: &str, tty: bool) {
 /// - `\x1b[2K`：擦除整行
 /// - 然后写新的 `✅ {text}\n`
 fn print_final_replace(text: &str, tty: bool) {
+    let compact = strip_display_spaces(text);
     if tty {
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "\x1b[1A\r\x1b[2K✅ {}\n", text);
+        let _ = write!(out, "\x1b[1A\r\x1b[2K✅ {}\n", compact);
         let _ = out.flush();
     } else {
         // piped 下没有"上一行"可覆盖，追加新行
-        println!("\n✅ {}", text);
+        println!("\n✅ {}", compact);
     }
+}
+
+/// 流式 Zipformer transducer 模型（x-asr）在中文字符之间插入 ASCII 空格作为视觉分隔符
+/// （中文 ASR 的常见做法）。这种空格在显示和相似度计算中都应该被去掉：
+/// - 显示：避免屏幕看到"今 天 天"而不是"今天天"
+/// - 相似度：流式与精修（CTC 无空格）的对齐比较会因空格不一致而失真
+///
+/// 只过滤 ASCII 空格 `' '`，保留：
+/// - 中英混输时的实际空格（如 "divide test" 中的空格）
+/// - 中文全角空格 `　`
+/// - 标点 `，。！？`
+fn strip_display_spaces(s: &str) -> String {
+    s.chars().filter(|c| *c != ' ').collect()
+}
+
+/// 比较时双方都先 strip 空格（避免流式带空格 vs 精修无空格导致的假性不匹配）。
+fn normalize_for_compare(s: &str) -> String {
+    strip_display_spaces(s)
 }
 
 /// 把一段音频喂给非流式 recognizer 拿精修文本。
@@ -688,6 +745,8 @@ fn refine_segment(
 /// - 一端空一端非空 → 0.0
 fn jaccard(a: &str, b: &str) -> f32 {
     use std::collections::HashMap;
+    let a = normalize_for_compare(a);
+    let b = normalize_for_compare(b);
     if a == b {
         return 1.0;
     }
@@ -725,6 +784,8 @@ fn jaccard(a: &str, b: &str) -> f32 {
 /// 当一方显著短于另一方时（如精修掉了 30% 字符），分数降下来，
 /// 即使字符组成相似也不能信任。
 fn length_ratio(a: &str, b: &str) -> f32 {
+    let a = normalize_for_compare(a);
+    let b = normalize_for_compare(b);
     let len_a = a.chars().count() as f32;
     let len_b = b.chars().count() as f32;
     let max = len_a.max(len_b);
@@ -742,6 +803,8 @@ fn length_ratio(a: &str, b: &str) -> f32 {
 const PREFIX_MATCH_LEN: usize = 5;
 
 fn prefix_match(a: &str, b: &str, n: usize) -> f32 {
+    let a = normalize_for_compare(a);
+    let b = normalize_for_compare(b);
     let a_prefix: Vec<char> = a.chars().take(n).collect();
     let b_prefix: Vec<char> = b.chars().take(n).collect();
     if a_prefix.is_empty() && b_prefix.is_empty() {

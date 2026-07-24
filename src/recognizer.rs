@@ -27,10 +27,25 @@ impl RecognizerEngine {
         device_name: Option<String>,
         vad_config: VadConfig,
     ) -> Result<Self> {
+        // 流式 ASR 模型：Zipformer transducer（中英双语 + 内置标点）
+        let stream_subdir = "sherpa-onnx-x-asr-960ms-streaming-zipformer-transducer-zh-en-punct-int8-2026-06-05";
         let recognizer = OnlineRecognizer::new(
-            &model_dir.join("encoder.int8.onnx").to_string_lossy(),
-            &model_dir.join("decoder.int8.onnx").to_string_lossy(),
-            &model_dir.join("tokens.txt").to_string_lossy(),
+            &model_dir
+                .join(stream_subdir)
+                .join("encoder.int8.onnx")
+                .to_string_lossy(),
+            &model_dir
+                .join(stream_subdir)
+                .join("decoder.onnx")
+                .to_string_lossy(),
+            &model_dir
+                .join(stream_subdir)
+                .join("joiner.int8.onnx")
+                .to_string_lossy(),
+            &model_dir
+                .join(stream_subdir)
+                .join("tokens.txt")
+                .to_string_lossy(),
             4,
         )?;
 

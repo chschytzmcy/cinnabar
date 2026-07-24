@@ -36,6 +36,10 @@ pub struct Config {
     pub offline_provider: String,
     #[serde(default = "default_offline_decoding")]
     pub offline_decoding: String,
+    #[serde(default = "default_offline_hotwords_file")]
+    pub offline_hotwords_file: String,
+    #[serde(default = "default_offline_hotwords_score")]
+    pub offline_hotwords_score: f32,
     #[serde(default = "default_enable_offline_refine")]
     pub enable_offline_refine: bool,
 
@@ -81,14 +85,25 @@ fn default_vad_provider() -> String {
     "cpu".to_string()
 }
 
-// 离线 ASR 默认值：Zipformer CTC 中文 int8 模型
-// （sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03，由 ./setup_models.sh 下载）
+// 离线 ASR 默认值：Paraformer zh-2023-09-14（中文 attention decoder，223MB int8）
+// 选 Paraformer 因为 attention decoder 在 beam search 阶段对热词加权最稳定
+// （CTC 框架的热词加成弱，SenseVoice 是 encoder-only 不支持 beam bias）
 fn default_offline_model_path() -> String {
-    "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx".to_string()
+    "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.onnx".to_string()
 }
 
 fn default_offline_tokens_path() -> String {
-    "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt".to_string()
+    "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt".to_string()
+}
+
+/// 热词文件路径；空字符串表示关闭热词功能
+fn default_offline_hotwords_file() -> String {
+    "".to_string()
+}
+
+/// 热词加成权重 0.0-2.0 范围；0.0 关闭，1.0 中等，2.0 强烈
+fn default_offline_hotwords_score() -> f32 {
+    1.5
 }
 
 fn default_offline_num_threads() -> i32 {
@@ -129,6 +144,8 @@ impl Default for Config {
             offline_num_threads: default_offline_num_threads(),
             offline_provider: default_offline_provider(),
             offline_decoding: default_offline_decoding(),
+            offline_hotwords_file: default_offline_hotwords_file(),
+            offline_hotwords_score: default_offline_hotwords_score(),
             enable_offline_refine: default_enable_offline_refine(),
             hotkey: default_hotkey(),
         }
@@ -183,11 +200,15 @@ mod tests {
     #[test]
     fn test_config_offline_fields_default() {
         let c = Config::default();
-        assert!(c.offline_model_path.ends_with("model.int8.onnx"));
+        // Paraformer-zh-2023-09-14 是 model.onnx（非 int8）
+        assert!(c.offline_model_path.ends_with("model.onnx"));
         assert!(c.offline_tokens_path.ends_with("tokens.txt"));
+        assert!(c.offline_model_path.contains("paraformer-zh"));
         assert_eq!(c.offline_num_threads, 2);
         assert_eq!(c.offline_provider, "cpu");
         assert_eq!(c.offline_decoding, "greedy_search");
+        assert_eq!(c.offline_hotwords_file, "");
+        assert_eq!(c.offline_hotwords_score, 1.5);
         assert!(c.enable_offline_refine);
     }
 

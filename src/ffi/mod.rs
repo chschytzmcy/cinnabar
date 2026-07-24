@@ -419,6 +419,7 @@ pub struct OnlineRecognizer {
     recognizer: *mut SherpaOnnxOnlineRecognizer,
     _encoder: CString,
     _decoder: CString,
+    _joiner: CString,
     _tokens: CString,
     _provider: CString,
     _decoding: CString,
@@ -438,12 +439,14 @@ impl OnlineRecognizer {
     pub fn new(
         encoder: &str,
         decoder: &str,
+        joiner: &str,
         tokens: &str,
         num_threads: i32,
     ) -> anyhow::Result<Self> {
         unsafe {
             let encoder_c = CString::new(encoder).unwrap();
             let decoder_c = CString::new(decoder).unwrap();
+            let joiner_c = CString::new(joiner).unwrap();
             let tokens_c = CString::new(tokens).unwrap();
             let provider_c = CString::new("cpu").unwrap();
             let decoding_c = CString::new("greedy_search").unwrap();
@@ -454,14 +457,16 @@ impl OnlineRecognizer {
                     feature_dim: 80,
                 },
                 model_config: SherpaOnnxOnlineModelConfig {
+                    // 流式 Zipformer transducer 三文件路径（encoder/decoder/joiner）
                     transducer: SherpaOnnxOnlineTransducerModelConfig {
-                        encoder: ptr::null(),
-                        decoder: ptr::null(),
-                        joiner: ptr::null(),
-                    },
-                    paraformer: SherpaOnnxOnlineParaformerModelConfig {
                         encoder: encoder_c.as_ptr(),
                         decoder: decoder_c.as_ptr(),
+                        joiner: joiner_c.as_ptr(),
+                    },
+                    // 不再用 Paraformer
+                    paraformer: SherpaOnnxOnlineParaformerModelConfig {
+                        encoder: ptr::null(),
+                        decoder: ptr::null(),
                     },
                     zipformer2_ctc: SherpaOnnxOnlineZipformer2CtcModelConfig { model: ptr::null() },
                     tokens: tokens_c.as_ptr(),
@@ -508,6 +513,7 @@ impl OnlineRecognizer {
                 recognizer,
                 _encoder: encoder_c,
                 _decoder: decoder_c,
+                _joiner: joiner_c,
                 _tokens: tokens_c,
                 _provider: provider_c,
                 _decoding: decoding_c,
@@ -789,6 +795,7 @@ pub struct OfflineRecognizer {
     _tokens_path: CString,
     _provider: CString,
     _decoding: CString,
+    _hotwords_file: CString,
 }
 
 unsafe impl Send for OfflineRecognizer {}
@@ -803,14 +810,20 @@ unsafe impl Send for OfflineStream {}
 unsafe impl Sync for OfflineStream {}
 
 impl OfflineRecognizer {
-    /// 创建非流式 recognizer。当前实现只支持 Zipformer CTC（plan §1.1）。
-    /// 模型路径是 `model.int8.onnx` 单文件；tokens.txt 是分词表。
+    /// 创建非流式 recognizer。当前用 Paraformer（中文优先，attention decoder）。
+    /// - `model_path`：`model.onnx` 单文件
+    /// - `tokens_path`：`tokens.txt` 分词表
+    /// - `decoding_method`：通常 "greedy_search" 或 "modified_beam_search"
+    /// Paraformer 的 attention decoder 支持 hotword bias（CLI flag --hotwords-file）
+    /// 通过 beam search 内部加权实现，比 CTC 框架热词加成可靠得多。
     pub fn new(
         model_path: &str,
         tokens_path: &str,
         num_threads: i32,
         provider: &str,
         decoding_method: &str,
+        hotwords_file: Option<&str>,
+        hotwords_score: f32,
     ) -> anyhow::Result<Self> {
         unsafe {
             let model_c = CString::new(model_path)
@@ -821,6 +834,12 @@ impl OfflineRecognizer {
                 .map_err(|e| anyhow::anyhow!("provider 含 NUL: {}", e))?;
             let decoding_c = CString::new(decoding_method)
                 .map_err(|e| anyhow::anyhow!("decoding_method 含 NUL: {}", e))?;
+            // hotwords_file 可选；空字符串或 None 表示关闭
+            let hotwords_file_c = match hotwords_file {
+                Some(p) => CString::new(p)
+                    .map_err(|e| anyhow::anyhow!("hotwords_file 含 NUL: {}", e))?,
+                None => CString::new("").unwrap(),
+            };
 
             let config = SherpaOnnxOfflineRecognizerConfig {
                 feat_config: SherpaOnnxFeatureConfig {
@@ -828,13 +847,13 @@ impl OfflineRecognizer {
                     feature_dim: 80,
                 },
                 model_config: SherpaOnnxOfflineModelConfig {
-                    // 占位全部置零 / null：本项目只用 zipformer_ctc
+                    // 占位全部置零 / null：本项目只用 paraformer
                     transducer: SherpaOnnxOfflineTransducerModelConfig {
                         encoder: ptr::null(),
                         decoder: ptr::null(),
                         joiner: ptr::null(),
                     },
-                    paraformer: SherpaOnnxOfflineParaformerModelConfig { model: ptr::null() },
+                    // paraformer 字段在下面 ★ 真正在用的槽位 处填
                     nemo_ctc: SherpaOnnxOfflineNemoEncDecCtcModelConfig { model: ptr::null() },
                     whisper: SherpaOnnxOfflineWhisperModelConfig {
                         encoder: ptr::null(),
@@ -868,9 +887,13 @@ impl OfflineRecognizer {
                         decoder: ptr::null(),
                     },
                     dolphin: SherpaOnnxOfflineDolphinModelConfig { model: ptr::null() },
-                    // ★ 真正在用的槽位
-                    zipformer_ctc: SherpaOnnxOfflineZipformerCtcModelConfig {
+                    // ★ 真正在用的槽位：Paraformer attention decoder
+                    // attention decoder 支持 hotwords_file + hotwords_score 在 beam search 阶段加权
+                    paraformer: SherpaOnnxOfflineParaformerModelConfig {
                         model: model_c.as_ptr(),
+                    },
+                    zipformer_ctc: SherpaOnnxOfflineZipformerCtcModelConfig {
+                        model: ptr::null(),
                     },
                     canary: SherpaOnnxOfflineCanaryModelConfig {
                         encoder: ptr::null(),
@@ -886,8 +909,8 @@ impl OfflineRecognizer {
                 },
                 decoding_method: decoding_c.as_ptr(),
                 max_active_paths: 4,
-                hotwords_file: ptr::null(),
-                hotwords_score: 0.0,
+                hotwords_file: hotwords_file_c.as_ptr(),
+                hotwords_score,
                 rule_fsts: ptr::null(),
                 rule_fars: ptr::null(),
                 blank_penalty: 0.0,
@@ -913,6 +936,7 @@ impl OfflineRecognizer {
                 _tokens_path: tokens_c,
                 _provider: provider_c,
                 _decoding: decoding_c,
+                _hotwords_file: hotwords_file_c,
             })
         }
     }
