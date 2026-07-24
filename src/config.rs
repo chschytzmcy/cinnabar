@@ -97,9 +97,11 @@ fn default_offline_tokens_path() -> String {
 }
 
 /// 热词文件路径；空字符串表示关闭热词功能
-/// 默认指向 `docs/hotword.md`（仓库自带的人名/地名/公司名热词清单）
+///
+/// ⚠️  v1.12.9 与 Paraformer + hotwords_file 不兼容（详见 default_offline_decoding 注释）。
+///     升级到 v1.13+ 后可改为 "./docs/hotword.md" 启用。
 fn default_offline_hotwords_file() -> String {
-    "./docs/hotword.md".to_string()
+    "".to_string()
 }
 
 /// 热词加成权重 0.0-2.0 范围；0.0 关闭，1.0 中等，2.0 强烈
@@ -115,12 +117,17 @@ fn default_offline_provider() -> String {
     "cpu".to_string()
 }
 
-/// Zipformer CTC 模型 beam search 增益极小，greedy 既快又准。
+/// v1.12.9 vendored lib 的 Paraformer 实现只支持 greedy_search
+/// （offline-recognizer-paraformer-impl.h:95: "Only greedy_search is supported at present"）。
+/// 同时 v1.12.9 的 C-API 验证器（offline-recognizer.cc:83）会拒绝 greedy+hotwords_file
+/// 组合 —— 即"用了 hotwords_file 必须用 modified_beam_search"—— 但 modified_beam_search
+/// 又被 Paraformer 实现拒绝。结论：v1.12.9 Paraformer 的 hotwords 路径完全不可用。
+///
+/// 退而求其次：默认 greedy_search（Paraformer 唯一支持的解码方法），
+/// 同时默认禁用 hotwords_file（v1.12.9 与 greedy 冲突）。
+/// 升级到 v1.13+ 可以解锁 hotwords+beam_search 组合。
 fn default_offline_decoding() -> String {
-    // Paraformer 在使用 hotwords_file 时 C-API 强制要求 modified_beam_search
-    // （hotword bias 只能在 beam search 阶段加权，greedy 不支持）。
-    // 即使没开热词，modified_beam_search 也会比 greedy 更准，代价是 ~10-30% 延迟。
-    "modified_beam_search".to_string()
+    "greedy_search".to_string()
 }
 
 fn default_enable_offline_refine() -> bool {
@@ -210,10 +217,10 @@ mod tests {
         assert!(c.offline_model_path.contains("paraformer-zh"));
         assert_eq!(c.offline_num_threads, 2);
         assert_eq!(c.offline_provider, "cpu");
-        // 默认 modified_beam_search（Paraformer + 热词要求）
-        assert_eq!(c.offline_decoding, "modified_beam_search");
-        // 默认热词文件指向仓库自带的 docs/hotword.md
-        assert!(c.offline_hotwords_file.ends_with("hotword.md"));
+        // v1.12.9 Paraformer 唯一支持 greedy_search
+        assert_eq!(c.offline_decoding, "greedy_search");
+        // v1.12.9 Paraformer + hotwords 路径不可用，默认禁用
+        assert_eq!(c.offline_hotwords_file, "");
         assert_eq!(c.offline_hotwords_score, 1.5);
         assert!(c.enable_offline_refine);
     }

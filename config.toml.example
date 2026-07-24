@@ -52,10 +52,10 @@ offline_model_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.o
 offline_tokens_path = "./models/sherpa-onnx-paraformer-zh-2023-09-14/tokens.txt"
 
 # 热词文件（每行一个词或短语）；空字符串 = 关闭
-# 仓库自带 docs/hotword.md（人名/地名/品牌/公司名）
-# 格式：纯 UTF-8 文本，每行一个热词，# 开头为注释
-offline_hotwords_file = "./docs/hotword.md"
-offline_hotwords_score = 1.5  # 0.0-2.0 范围
+# ⚠️  v1.12.9 Paraformer + hotwords_file 不兼容（实现不支持 beam_search）。
+#     升级到 v1.13+ 后可启用。仓库自带 docs/hotword.md（人名/地名/品牌/公司名）。
+offline_hotwords_file = ""
+offline_hotwords_score = 1.5  # 0.0-2.0 范围（启用热词时才生效）
 
 # onnxruntime 推理线程数（Zipformer CTC 单线程也快，2 够用）
 offline_num_threads = 2
@@ -63,10 +63,9 @@ offline_num_threads = 2
 # 执行 provider（"cpu" / "cuda" / "coreml"）
 offline_provider = "cpu"
 
-# 解码方法：Paraformer 使用 hotwords_file 时 C-API 强制要求 modified_beam_search
-# （hotword bias 只能在 beam search 阶段加权）。modified_beam_search 本身也更准，
-# 比 greedy_search 慢 10-30%，但对短段 refine 场景可忽略。
-offline_decoding = "modified_beam_search"
+# 解码方法：v1.12.9 Paraformer 实现只支持 greedy_search（offline-recognizer-paraformer-impl.h:95）
+# 升级到 v1.13+ 后可改 modified_beam_search 以支持热词加成。
+offline_decoding = "greedy_search"
 
 # 是否启用离线精修。设为 false 时退回纯流式（更省内存 / 老 CPU 推荐）。
 enable_offline_refine = true
