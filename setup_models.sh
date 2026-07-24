@@ -64,7 +64,7 @@ fi
 
 # ---- ASR 非流式（精修用）模型 ----
 OFFLINE_DIR="${MODEL_DIR}/${OFFLINE_MODEL_NAME}"
-if [ ! -f "${OFFLINE_DIR}/model.onnx" ] || [ ! -f "${OFFLINE_DIR}/tokens.txt" ]; then
+if [ ! -f "${OFFLINE_DIR}/model.int8.onnx" ] || [ ! -f "${OFFLINE_DIR}/tokens.txt" ]; then
     echo "📥 Downloading ASR offline model: ${OFFLINE_MODEL_NAME} (~223MB)..."
     wget -q --show-progress "${OFFLINE_MODEL_URL}" -O "${TMP_DIR}/offline.tar.bz2"
     echo "📦 Extracting offline model..."

@@ -85,11 +85,11 @@ fn default_vad_provider() -> String {
     "cpu".to_string()
 }
 
-// 离线 ASR 默认值：Paraformer zh-2023-09-14（中文 attention decoder，223MB int8）
+// 离线 ASR 默认值：Paraformer zh-2023-09-14（中文 attention decoder，233MB int8）
 // 选 Paraformer 因为 attention decoder 在 beam search 阶段对热词加权最稳定
 // （CTC 框架的热词加成弱，SenseVoice 是 encoder-only 不支持 beam bias）
 fn default_offline_model_path() -> String {
-    "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.onnx".to_string()
+    "./models/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx".to_string()
 }
 
 fn default_offline_tokens_path() -> String {
@@ -117,7 +117,10 @@ fn default_offline_provider() -> String {
 
 /// Zipformer CTC 模型 beam search 增益极小，greedy 既快又准。
 fn default_offline_decoding() -> String {
-    "greedy_search".to_string()
+    // Paraformer 在使用 hotwords_file 时 C-API 强制要求 modified_beam_search
+    // （hotword bias 只能在 beam search 阶段加权，greedy 不支持）。
+    // 即使没开热词，modified_beam_search 也会比 greedy 更准，代价是 ~10-30% 延迟。
+    "modified_beam_search".to_string()
 }
 
 fn default_enable_offline_refine() -> bool {
@@ -201,13 +204,14 @@ mod tests {
     #[test]
     fn test_config_offline_fields_default() {
         let c = Config::default();
-        // Paraformer-zh-2023-09-14 是 model.onnx（非 int8）
-        assert!(c.offline_model_path.ends_with("model.onnx"));
+        // Paraformer-zh-2023-09-14 是 model.int8.onnx（int8 版本）
+        assert!(c.offline_model_path.ends_with("model.int8.onnx"));
         assert!(c.offline_tokens_path.ends_with("tokens.txt"));
         assert!(c.offline_model_path.contains("paraformer-zh"));
         assert_eq!(c.offline_num_threads, 2);
         assert_eq!(c.offline_provider, "cpu");
-        assert_eq!(c.offline_decoding, "greedy_search");
+        // 默认 modified_beam_search（Paraformer + 热词要求）
+        assert_eq!(c.offline_decoding, "modified_beam_search");
         // 默认热词文件指向仓库自带的 docs/hotword.md
         assert!(c.offline_hotwords_file.ends_with("hotword.md"));
         assert_eq!(c.offline_hotwords_score, 1.5);
