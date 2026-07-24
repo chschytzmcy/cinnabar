@@ -183,16 +183,24 @@ git clone git@github.com:yourusername/cinnabar.git
 
 **4. 下载模型文件**
 
-```cinnabar/docs/INSTALL.md#L1-10
-# 运行模型下载脚本
+```bash
+# 运行模型下载脚本（同时下载 ASR + ten-vad）
 ./setup_models.sh
 
 # 验证模型文件
 ls -lh models/
 # 应该看到：
-# - encoder.int8.onnx (~20MB)
-# - decoder.int8.onnx (~20MB)
-# - tokens.txt (~500KB)
+# - encoder.int8.onnx (~20MB)        ← ASR
+# - decoder.int8.onnx (~20MB)        ← ASR
+# - tokens.txt     (~500KB)          ← ASR
+# - ten-vad.onnx  (~324KB)           ← VAD（v1.2.4+）
+```
+
+如果 ten-vad 模型缺失，会在启动时报错 `创建 ten-vad VoiceActivityDetector 失败`；可手动下载：
+
+```bash
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/ten-vad.onnx \
+     -O models/ten-vad.onnx
 ```
 
 **5. 编译项目**

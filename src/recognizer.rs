@@ -1,12 +1,13 @@
-use crate::ffi::OnlineRecognizer;
+use crate::ffi::{OnlineRecognizer, OnlineStream, VoiceActivityDetector};
 use crate::resampler::LinearResampler;
-use crate::vad::{EndpointDetector, VadDetector};
+use crate::vad::{VadConfig, drain_segments};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use crossbeam_channel::{bounded, Receiver};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// GUI 模式下的识别引擎包装。同时持有 ASR recognizer、ten-vad VAD 和 cpal 音频流。
 pub struct RecognizerEngine {
     recognizer: OnlineRecognizer,
     _stream: cpal::Stream,
@@ -14,8 +15,9 @@ pub struct RecognizerEngine {
     running: Arc<AtomicBool>,
     resampler: Option<LinearResampler>,
     target_sample_rate: u32,
-    vad: VadDetector,
-    endpoint_detector: EndpointDetector,
+    vad: VoiceActivityDetector,
+    vad_cfg: VadConfig,
+    cumulative_segment_id: u64,
 }
 
 impl RecognizerEngine {
@@ -23,6 +25,7 @@ impl RecognizerEngine {
         model_dir: &std::path::Path,
         device_idx: Option<usize>,
         device_name: Option<String>,
+        vad_config: VadConfig,
     ) -> Result<Self> {
         let recognizer = OnlineRecognizer::new(
             &model_dir.join("encoder.int8.onnx").to_string_lossy(),
@@ -106,6 +109,9 @@ impl RecognizerEngine {
             None
         };
 
+        // ten-vad 由 CLI 模式同样的 VadConfig 路径构造；GUI 也用同一个 Config 字段。
+        let vad = vad_config.build().context("创建 ten-vad 失败（GUI 模式）")?;
+
         Ok(Self {
             recognizer,
             _stream: stream,
@@ -113,8 +119,9 @@ impl RecognizerEngine {
             running: Arc::new(AtomicBool::new(false)),
             resampler,
             target_sample_rate,
-            vad: VadDetector::new(0.01),
-            endpoint_detector: EndpointDetector::new(0.01, target_sample_rate, 1.2, 0.5),
+            vad,
+            vad_cfg: vad_config,
+            cumulative_segment_id: 0,
         })
     }
 
@@ -127,59 +134,98 @@ impl RecognizerEngine {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    pub fn process(&mut self, stream: &mut crate::ffi::OnlineStream) -> Option<String> {
-        if !self.running.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        if let Ok(samples) = self.rx.try_recv() {
-            if samples.is_empty() {
-                return None;
-            }
-
-            // VAD 检测
-            if !self.vad.is_speech(&samples) {
-                return None;
-            }
-
-            let resampled = if let Some(ref mut r) = self.resampler {
-                r.resample(&samples)
-            } else {
-                samples
-            };
-
-            if resampled.is_empty() {
-                return None;
-            }
-
-            stream.accept_waveform(self.target_sample_rate as i32, &resampled);
-
-            while self.recognizer.is_ready(stream) {
-                self.recognizer.decode(stream);
-            }
-
-            let result = self.recognizer.get_result(stream);
-            let trimmed = result.trim();
-
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-
-        None
-    }
-
-    pub fn create_stream(&self) -> crate::ffi::OnlineStream {
+    /// 创建一段新的 ASR 流（GUI 端在 segment 结束时调用，绕开 sherpa-onnx 1.12.9 reset 崩溃）。
+    pub fn create_stream(&self) -> OnlineStream {
         self.recognizer.create_stream()
     }
 
-    #[allow(dead_code)]
-    pub fn is_endpoint(&mut self, samples: &[f32]) -> bool {
-        self.endpoint_detector.accept_waveform(samples)
+    /// 拉取一条音频并推进 ASR + ten-vad，返回这一轮的状态信号。
+    ///
+    /// 调用方按返回值三种情况分别处理：
+    /// - `Idle`：还没准备好或没新音频
+    /// - `Partial(text)`：ASR 出了新文本，刷新 UI
+    /// - `SegmentEnded { text, .. }`：ten-vad 切 segment，提交并粘贴
+    pub fn process(&mut self, stream: &mut OnlineStream) -> ProcessOutcome {
+        if !self.running.load(Ordering::Relaxed) {
+            return ProcessOutcome::Idle;
+        }
+
+        let samples = match self.rx.try_recv() {
+            Ok(s) => s,
+            Err(_) => return ProcessOutcome::Idle,
+        };
+        if samples.is_empty() {
+            return ProcessOutcome::Idle;
+        }
+
+        // 重采样 → 16 kHz（VAD/ASR 双方都期望 16 kHz）
+        let resampled = if let Some(ref mut r) = self.resampler {
+            r.resample(&samples)
+        } else {
+            samples
+        };
+        if resampled.is_empty() {
+            return ProcessOutcome::Idle;
+        }
+
+        // 1. ASR 吃数据
+        stream.accept_waveform(self.target_sample_rate as i32, &resampled);
+        // 2. VAD 也吃同样的数据
+        self.vad.accept_waveform(&resampled);
+
+        // 3. 触发解码
+        while self.recognizer.is_ready(stream) {
+            self.recognizer.decode(stream);
+        }
+
+        let result = self.recognizer.get_result(stream);
+        let trimmed = result.trim();
+
+        // 4. ten-vad 有没有切出新 segment？
+        let segments = drain_segments(&self.vad);
+        if !segments.is_empty() {
+            // 用最后一条 segment 作为 segment_id 锚点；多 segment 罕见，丢点 id 关系不大。
+            let _ = &segments;
+            let segment_id = self.cumulative_segment_id;
+            self.cumulative_segment_id = self.cumulative_segment_id.saturating_add(1);
+            // 拿当前 ASR 的最终文本（与 main.rs CLI 路径同样的语义）
+            return ProcessOutcome::SegmentEnded {
+                text: trimmed.to_string(),
+                segment_id,
+            };
+        }
+
+        if !trimmed.is_empty() {
+            return ProcessOutcome::Partial(trimmed.to_string());
+        }
+
+        ProcessOutcome::Idle
     }
 
-    #[allow(dead_code)]
-    pub fn reset_endpoint(&mut self) {
-        self.endpoint_detector.reset();
+    /// segment 结束后重建 ASR 流并清空 VAD 内部状态（GUI 端调用）。
+    pub fn reset_vad(&mut self) {
+        self.vad.reset();
     }
+
+    /// 供 GUI 查询 VAD 配置（写日志/调试用）。
+    #[allow(dead_code)]
+    pub fn vad_config(&self) -> &VadConfig {
+        &self.vad_cfg
+    }
+}
+
+/// `RecognizerEngine::process` 的返回值。`SegmentEnded` 同时携带最终文本，
+/// 让调用方（GUI）一次拿到 ASR 输出 + 提交信号，不必再二次轮询。
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum ProcessOutcome {
+    /// 没新音频或识别器没准备好
+    Idle,
+    /// 流式识别的新部分文本
+    Partial(String),
+    /// ten-vad 切段完成，附带最终文本与本会话内 segment 自增 id
+    SegmentEnded {
+        text: String,
+        segment_id: u64,
+    },
 }

@@ -77,11 +77,12 @@ Cinnabar 支持两种运行模式：
 ### 高级特性
 
 **语音活动检测（VAD）**：✅
-- [x] 集成简单 VAD（能量阈值检测）
+- [x] 集成简单 VAD（能量阈值检测）   ← v1.0 - v1.2.3
 - [x] 自动检测说话开始/结束
 - [x] 降低功耗和 CPU 使用率
-- [x] 实现 EndpointDetector（VAD + 静音时长）
+- [x] 实现 EndpointDetector（VAD + 静音时长）   ← v1.2.3
 - [x] 替代 sherpa-onnx 的不稳定 is_endpoint
+- [x] 升级到 ten-vad（神经网络 VAD）   ← v1.2.4，对噪声鲁棒、不依赖麦克风增益
 
 **配置管理**：✅
 - [x] 配置文件支持（TOML）

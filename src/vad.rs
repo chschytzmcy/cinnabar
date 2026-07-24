@@ -1,83 +1,93 @@
-pub struct VadDetector {
-    threshold: f32,
+//! `vad` —— ten-vad 的薄门面。
+//!
+//! 本模块不再做能量阈值或端点累积；只承担：
+//! 1. 持有 `VadConfig`（含 CLI flag + config.toml + 内置默认 的合并结果）
+//! 2. 构造 `ffi::VoiceActivityDetector`（配置走 ten-vad 槽位）
+//! 3. 提供 `drain_segments` 让调用方一次性拿走所有就绪 segment
+//!
+//! 识别与端点的耦合由 main.rs / recognizer.rs 自行处理（每条 segment = 一次
+//! ASR utterance commit + recognizer 流重建）。
+
+use crate::ffi::{SpeechSegment, VoiceActivityDetector};
+use anyhow::Result;
+
+/// ten-vad 的运行时配置。所有字段都从 config.toml + CLI flag + 内置默认合并得来。
+#[derive(Debug, Clone)]
+pub struct VadConfig {
+    /// ONNX 模型绝对或相对路径（默认 `./models/ten-vad.onnx`）。
+    pub model_path: String,
+    /// 语音概率阈值 0-1（默认 0.5）。
+    /// 与原能量阈值语义完全不同：现在是 ten-vad 模型输出的"是语音"概率。
+    pub threshold: f32,
+    /// 持续静音多久后切 segment（毫秒，默认 1200）。
+    pub min_silence_ms: u32,
+    /// 多短的语音才视为有效 segment（毫秒，默认 500）。
+    pub min_speech_ms: u32,
+    /// ten-vad 推理窗口大小（样本数，默认 256 = 16kHz 下 16ms）。
+    /// 必须匹配 sample_rate，常见值 256 / 512 / 768。
+    pub window_size: i32,
+    /// 单个 segment 最长多少秒（默认 20.0），超过会被强制切断。
+    pub max_speech_duration: f32,
+    /// onnxruntime 推理线程数（默认 2）。
+    pub num_threads: i32,
+    /// 执行 provider（"cpu" / "cuda" / "coreml"，默认 "cpu"）。
+    pub provider: String,
+    /// 采样率 Hz（默认 16000）。
+    pub sample_rate: u32,
 }
 
-impl VadDetector {
-    pub fn new(threshold: f32) -> Self {
-        Self { threshold }
-    }
-
-    pub fn is_speech(&self, samples: &[f32]) -> bool {
-        let energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
-        energy > self.threshold
-    }
-}
-
-pub struct EndpointDetector {
-    vad: VadDetector,
-    sample_rate: u32,
-    min_silence_duration: f32,
-    min_speech_duration: f32,
-    silence_samples: u32,
-    speech_samples: u32,
-}
-
-impl EndpointDetector {
-    pub fn new(
-        vad_threshold: f32,
-        sample_rate: u32,
-        min_silence_duration: f32,
-        min_speech_duration: f32,
-    ) -> Self {
+impl Default for VadConfig {
+    fn default() -> Self {
         Self {
-            vad: VadDetector::new(vad_threshold),
-            sample_rate,
-            min_silence_duration,
-            min_speech_duration,
-            silence_samples: 0,
-            speech_samples: 0,
+            model_path: "./models/ten-vad.onnx".into(),
+            threshold: 0.5,
+            min_silence_ms: 1200,
+            min_speech_ms: 500,
+            window_size: 256,
+            max_speech_duration: 20.0,
+            num_threads: 2,
+            provider: "cpu".into(),
+            sample_rate: 16000,
         }
     }
+}
 
-    pub fn accept_waveform(&mut self, samples: &[f32]) -> bool {
-        let is_speech = self.vad.is_speech(samples);
+impl VadConfig {
+    /// 构建一个 `VoiceActivityDetector` 实例。失败一般意味着模型路径不对、
+    /// ONNX 文件损坏、或 window_size 与 sample_rate 不匹配。
+    pub fn build(&self) -> Result<VoiceActivityDetector> {
+        VoiceActivityDetector::new(
+            &self.model_path,
+            self.threshold,
+            self.min_silence_ms as f32 / 1000.0,
+            self.min_speech_ms as f32 / 1000.0,
+            self.window_size,
+            self.max_speech_duration,
+            self.sample_rate as i32,
+            self.num_threads,
+            &self.provider,
+            60.0, // buffer_size_in_seconds：足够缓存 ~60s 的音频避免长句丢失
+        )
+    }
+}
 
-        if is_speech {
-            self.speech_samples += samples.len() as u32;
-            self.silence_samples = 0;
-        } else {
-            self.silence_samples += samples.len() as u32;
+/// 一次性拉取并弹出所有已就绪的 segment（按"先来先出"顺序）。
+///
+/// 调用前通常先 `vad.accept_waveform(...)`，然后让模型跑完；调本函数可以
+/// 把"还没处理的 segment"批量取走。每取一个内部会 `front()+pop()`，samples
+/// 已经被拷成 owned `Vec<f32>`，调用方拿到后即可放心持有。
+///
+/// 跳过 `samples.is_empty()` 的 segment（理论上不应出现，但前端做防御）。
+pub fn drain_segments(vad: &VoiceActivityDetector) -> Vec<SpeechSegment> {
+    let mut out = Vec::new();
+    while !vad.is_empty() {
+        let seg = vad.front();
+        vad.pop();
+        if !seg.samples.is_empty() {
+            out.push(seg);
         }
-
-        self.is_endpoint()
     }
-
-    pub fn is_endpoint(&self) -> bool {
-        let silence_duration = self.silence_samples as f32 / self.sample_rate as f32;
-        let speech_duration = self.speech_samples as f32 / self.sample_rate as f32;
-
-        speech_duration >= self.min_speech_duration && silence_duration >= self.min_silence_duration
-    }
-
-    pub fn reset(&mut self) {
-        self.silence_samples = 0;
-        self.speech_samples = 0;
-    }
-
-    /// 当前已采样的采样率。日志里用它把 samples 数转毫秒。
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    /// 累计的语音样本数（reset 后从 0 累加）。
-    pub fn speech_samples(&self) -> u32 {
-        self.speech_samples
-    }
-
-    /// 累计的静音样本数（reset 后从 0 累加）。
-    pub fn silence_samples(&self) -> u32 {
-        self.silence_samples
-    }
+    out
 }
 
 #[cfg(test)]
@@ -85,43 +95,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vad_silence() {
-        let vad = VadDetector::new(0.01);
-        let silence = vec![0.0; 100];
-        assert!(!vad.is_speech(&silence));
-    }
-
-    #[test]
-    fn test_vad_speech() {
-        let vad = VadDetector::new(0.01);
-        let speech: Vec<f32> = (0..100).map(|i| (i as f32 * 0.1).sin()).collect();
-        assert!(vad.is_speech(&speech));
-    }
-
-    #[test]
-    fn test_vad_threshold() {
-        let vad = VadDetector::new(0.5);
-        let low_energy = vec![0.1; 100];
-        assert!(!vad.is_speech(&low_energy));
-    }
-
-    #[test]
-    fn test_endpoint_detector() {
-        let mut detector = EndpointDetector::new(0.01, 16000, 1.0, 0.5);
-
-        let speech: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.1).sin()).collect();
-        assert!(!detector.accept_waveform(&speech));
-
-        let silence = vec![0.0; 16000];
-        assert!(detector.accept_waveform(&silence));
-    }
-
-    #[test]
-    fn test_endpoint_reset() {
-        let mut detector = EndpointDetector::new(0.01, 16000, 1.0, 0.5);
-        let speech: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.1).sin()).collect();
-        detector.accept_waveform(&speech);
-        detector.reset();
-        assert!(!detector.is_endpoint());
+    fn default_config_sane() {
+        let c = VadConfig::default();
+        assert_eq!(c.sample_rate, 16000);
+        assert!(c.threshold > 0.0 && c.threshold < 1.0);
+        assert!(c.min_silence_ms >= 200);
+        assert!(c.min_speech_ms >= 100);
+        assert!(c.num_threads >= 1);
+        assert!(c.window_size > 0);
+        assert!(c.max_speech_duration > 0.0);
+        assert_eq!(c.provider, "cpu");
     }
 }

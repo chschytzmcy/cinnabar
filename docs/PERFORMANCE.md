@@ -237,19 +237,24 @@ rx.recv_timeout(std::time::Duration::from_millis(200))
 rx.recv()
 ```
 
-### 2. 启用 VAD（已实现）
+### 2. 启用 VAD（ten-vad，v1.2.4+）
 
-VAD 会自动跳过静音段，降低 CPU 使用率。
+ten-vad 神经网络 VAD 自动判断 segment 边界，比早期能量阈值 VAD 更省心。
 
-调整 VAD 阈值（编辑 `src/main.rs`）：
+调整 VAD 阈值（编辑 `config.toml` 或 CLI flag 覆盖）：
 
-```cinnabar/src/main.rs#L1-5
-// 更高的阈值 = 更少的处理 = 更省电
-let mut endpoint_detector = EndpointDetector::new(
-    0.02,  // 从 0.01 提高到 0.02
-    16000, 1.2, 0.5
-);
+```toml
+# 更高的阈值 = 更严格的语音判定 = 更省电（但容易漏检弱音）
+vad_threshold = 0.6
+
+# 更短的推理窗口 = 更频繁的判断 = CPU 略高
+vad_window_size = 256
+
+# 减少推理线程
+vad_num_threads = 1
 ```
+
+注意：ten-vad 的 threshold 是概率（0.0-1.0），不再使用早期 `0.01` 能量阈值，**两者语义不同**。
 
 ### 3. 使用节能模式
 

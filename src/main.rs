@@ -10,15 +10,17 @@ mod wayland;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use config::Config;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::bounded;
 use ffi::OnlineRecognizer;
-use logger::{SessionEndReason, SessionLog, SessionStartInfo};
+use logger::{SegmentCommitInfo, SessionEndReason, SessionLog, SessionStartInfo};
 use resampler::LinearResampler;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use vad::EndpointDetector;
+use vad::{VadConfig, drain_segments};
 
 #[derive(Parser, Debug)]
 #[command(name = "cinnabar")]
@@ -49,10 +51,67 @@ pub struct Args {
     /// 流式识别日志输出路径（JSONL）。默认 $XDG_DATA_HOME/cinnabar/sessions/。
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// 流式 partial 的最短输出间隔（毫秒）。
+    /// 值越小越跟手，但 partial 越多；150ms 是经验上比较舒服的折中。
+    /// 仅约束 partial 打印的节奏，不影响 endpoint 最终结果的立即输出。
+    #[arg(long, default_value_t = 150)]
+    debounce_ms: u64,
+
+    // --- ten-vad CLI 覆盖（优先级最高） ---
+    /// ten-vad ONNX 模型路径；覆盖 config.toml 的 vad_model_path。
+    #[arg(long)]
+    vad_model: Option<String>,
+
+    /// ten-vad 语音概率阈值 0.0-1.0；覆盖 config.toml 的 vad_threshold。
+    #[arg(long)]
+    vad_threshold: Option<f32>,
+
+    /// ten-vad 切 segment 所需的持续静音时长（毫秒）；覆盖 config.toml。
+    #[arg(long)]
+    vad_min_silence_ms: Option<u32>,
+
+    /// ten-vad 视语音有效所需的最短时长（毫秒）；覆盖 config.toml。
+    #[arg(long)]
+    vad_min_speech_ms: Option<u32>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // 加载 config.toml（CLI 模式此前不读 config，本轮修上）。
+    // 优先级：--vad-* CLI flag > config.toml > VadConfig::default()。
+    let config_path = args
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./config.toml"));
+    let file_config = Config::load(&config_path)
+        .with_context(|| format!("加载配置文件失败: {}", config_path.display()))?;
+
+    // 合并 VadConfig：CLI > 文件 > 默认
+    let mut vad_cfg = VadConfig {
+        model_path: file_config.vad_model_path.clone(),
+        threshold: file_config.vad_threshold,
+        min_silence_ms: file_config.vad_min_silence_ms,
+        min_speech_ms: file_config.vad_min_speech_ms,
+        window_size: file_config.vad_window_size,
+        max_speech_duration: file_config.vad_max_speech_duration,
+        num_threads: file_config.vad_num_threads,
+        provider: file_config.vad_provider.clone(),
+        sample_rate: 16000,
+    };
+    if let Some(p) = &args.vad_model {
+        vad_cfg.model_path = p.clone();
+    }
+    if let Some(t) = args.vad_threshold {
+        vad_cfg.threshold = t;
+    }
+    if let Some(s) = args.vad_min_silence_ms {
+        vad_cfg.min_silence_ms = s;
+    }
+    if let Some(s) = args.vad_min_speech_ms {
+        vad_cfg.min_speech_ms = s;
+    }
 
     // 流式日志：尽早打开，CLI 列表设备阶段也记 session_start 以便事后追溯
     let mut session_log = SessionLog::open(args.log_file.as_deref())
@@ -172,14 +231,11 @@ fn main() -> Result<()> {
     let (tx, rx) = bounded::<Vec<f32>>(100);
     let actual_sample_rate = config.sample_rate.0;
     let channels = config.channels;
-    let verbose = args.verbose;
+    let _verbose = args.verbose;
 
     let audio_stream = device.build_input_stream(
         &config,
         move |data: &[f32], _| {
-            if verbose {
-                eprintln!("[DEBUG] 音频回调: 接收到 {} 个样本", data.len());
-            }
             let mono_data: Vec<f32> = if channels > 1 {
                 data.chunks(channels as usize)
                     .map(|chunk| {
@@ -191,9 +247,6 @@ fn main() -> Result<()> {
             } else {
                 data.to_vec()
             };
-            if verbose {
-                eprintln!("[DEBUG] 音频回调: 混音后 {} 个样本", mono_data.len());
-            }
             let _ = tx.try_send(mono_data);
         },
         |err| eprintln!("错误：{}", err),
@@ -212,9 +265,10 @@ fn main() -> Result<()> {
         sample_rate: actual_sample_rate,
         channels: config.channels,
         resampled: use_resampler,
-        vad_threshold: 0.01,
-        min_silence_ms: 1200,
-        min_speech_ms: 500,
+        vad_model_path: vad_cfg.model_path.clone(),
+        vad_threshold: vad_cfg.threshold,
+        min_silence_ms: vad_cfg.min_silence_ms,
+        min_speech_ms: vad_cfg.min_speech_ms,
     });
 
     let mut resampler = if use_resampler {
@@ -223,151 +277,202 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut endpoint_detector = EndpointDetector::new(0.01, target_sample_rate, 1.2, 0.5);
+    // ten-vad：神经网络 VAD，由 sherpa-onnx C-API 直接驱动。
+    // 失败一般意味着模型路径错、ONNX 损坏、或 window_size 与 sample_rate 不匹配。
+    let vad = vad_cfg
+        .build()
+        .context("创建 ten-vad VoiceActivityDetector 失败（检查 --vad-model 路径）")?;
+
+    // 流式输出状态：
+    // - last_result：ASR 最近一次识别的文本
+    // - last_printed：屏幕上/管道里最后一次出现的文本（避免重复输出）
+    // - last_print_time：节流上次打印的时间戳
     let mut last_result = String::new();
     let mut last_printed = String::new();
-    let mut last_update_time = std::time::Instant::now();
+    let mut last_committed_final = String::new();
+    let mut last_print_time = std::time::Instant::now();
     let mut partial_seq: u64 = 0;
     let mut samples_in_session: u64 = 0;
+    let mut segment_id: u64 = 0;
+
+    // TTY 检测：终端下用 \r 就地更新，piped 下保持行式输出（更友好）。
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let debounce = std::time::Duration::from_millis(args.debounce_ms);
 
     while running.load(Ordering::Relaxed) {
         if let Ok(samples) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 接收到 {} 个样本", samples.len());
-            }
             if samples.is_empty() {
                 continue;
             }
 
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 开始重采样");
-            }
             let samples_16k = if let Some(ref mut r) = resampler {
                 r.resample(&samples)
             } else {
                 samples
             };
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 重采样后 {} 个样本", samples_16k.len());
-            }
 
             // 检查重采样后的数据是否为空
             if samples_16k.is_empty() {
                 continue;
             }
 
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 调用 accept_waveform");
-            }
             stream.accept_waveform(target_sample_rate as i32, &samples_16k);
             samples_in_session = samples_in_session.saturating_add(samples_16k.len() as u64);
 
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 检查 is_ready");
-            }
-            while recognizer.is_ready(&stream) {
-                if args.verbose {
-                    eprintln!("[DEBUG] 主循环: 调用 decode");
-                }
-                recognizer.decode(&mut stream);
-            }
+            // VAD 也吃同样的 16 kHz 样本，与 ASR 并行推进；VAD 自身决定何时切段。
+            // 先于 partial 打印之前调用，避免 partial 还没刷出来就被 final 覆盖掉。
+            vad.accept_waveform(&samples_16k);
 
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 获取结果");
+            while recognizer.is_ready(&stream) {
+                recognizer.decode(&mut stream);
             }
             let result = recognizer.get_result(&stream);
             let trimmed = result.trim();
 
-            let mut printed_just_now = false;
             if !trimmed.is_empty() && trimmed != last_result {
                 last_result = trimmed.to_string();
-                last_update_time = std::time::Instant::now();
                 partial_seq = partial_seq.saturating_add(1);
-                // 文本变更即落日志（printed=false），便于事后回放 ASR 模型的
-                // 贪心解码轨迹；真正打印到终端时再补一条 printed=true。
-                session_log.partial(partial_seq, trimmed, samples_in_session);
+                // 文本变更即落日志（printed=false），便于事后回放 ASR 模型的贪心解码轨迹；
+                // 真正打印到屏幕时再补一条 printed=true，便于区分"模型识别的轨迹"和
+                // "用户看到的轨迹"。
+                session_log.partial(partial_seq, trimmed, samples_in_session, false);
             }
 
-            // 如果超过 500ms 没有新内容，输出当前结果。
-            // 用 last_printed 记录上次实际打印过的内容，避免 partial 结果稳定
-            // 在多个 500ms 窗口里被反复打印（例如 "今" 持续不变时）。
+            // 节流 partial 打印：距上次打印至少 debounce_ms，且内容有变化。
+            // 与原来的 "500ms 无变化" 不同，这里只看打印节奏，不等 ASR 文本稳定，
+            // 所以跟手感大幅提升。TTY 下走就地覆盖（\r + ANSI clear-line），
+            // piped 下走普通 println，避免污染下游管道消费者。
             if !last_result.is_empty()
                 && last_result != last_printed
-                && last_update_time.elapsed().as_millis() > 500
+                && last_print_time.elapsed() >= debounce
             {
-                println!("{}", last_result);
+                print_partial(&last_result, stdout_is_tty);
                 last_printed = last_result.clone();
-                last_result.clear();
-                printed_just_now = true;
-            }
-            if printed_just_now {
-                // 已打印的 partial 也补一条日志，便于事后区分"模型已识别"和"用户可见"。
-                session_log.partial(partial_seq, &last_printed, samples_in_session);
+                last_print_time = std::time::Instant::now();
+                // 补一条"用户可见"的日志，printed=true。
+                session_log.partial(partial_seq, &last_printed, samples_in_session, true);
             }
 
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 检查 endpoint");
-            }
-            let is_endpoint = endpoint_detector.accept_waveform(&samples_16k);
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: endpoint = {}", is_endpoint);
-            }
-            if is_endpoint {
-                // 记录 endpoint 事件本身，包含语音/静音时长，便于复盘静音阈值。
-                let (speech_ms, silence_ms) = endpoint_snapshot(&endpoint_detector);
-                session_log.endpoint_detected(speech_ms, silence_ms);
-
-                if args.verbose {
-                    eprintln!("[DEBUG] 主循环: endpoint 为 true，获取最终结果");
-                }
-                let final_result = recognizer.get_result(&stream);
+            let segments = drain_segments(&vad);
+            if !segments.is_empty() {
                 if args.verbose {
                     eprintln!(
-                        "[DEBUG] 主循环: 获取到最终结果，长度 = {}",
-                        final_result.len()
+                        "[DEBUG] ten-vad 切出 {} 个 segment（id={}, samples={}, duration={}ms）",
+                        segments.len(),
+                        segment_id,
+                        segments.iter().map(|s| s.samples.len()).sum::<usize>(),
+                        segments
+                            .iter()
+                            .map(|s| (s.samples.len() as u64 * 1000)
+                                / (vad_cfg.sample_rate as u64).max(1))
+                            .sum::<u64>()
                     );
                 }
-                if !final_result.trim().is_empty() {
+                for seg in &segments {
+                    let final_result = recognizer.get_result(&stream);
                     let trimmed_final = final_result.trim();
-                    // endpoint 触发的最终结果：仅在和已打印内容不同时输出，
-                    // 避免和上面 500ms debounce 窗口重复。
-                    if trimmed_final != last_printed {
-                        println!("\n✅ {}", trimmed_final);
+                    let duration_ms = (seg.samples.len() as u64 * 1000)
+                        / (vad_cfg.sample_rate as u64).max(1);
+                    session_log.endpoint_detected(&SegmentCommitInfo {
+                        segment_id,
+                        start_sample: seg.start,
+                        samples: seg.samples.len() as u32,
+                        duration_ms,
+                    });
+                    if !trimmed_final.is_empty() {
+                        // TTY 下覆盖前一行 partial（如果还在），并以 \n 结束本行，
+                        // 让下一句 partial 从新行开始。piped 下保留 \n✅ 前缀风格。
+                        print_final(trimmed_final, stdout_is_tty);
                         last_printed = trimmed_final.to_string();
+                        last_committed_final = trimmed_final.to_string();
+                        session_log.final_result(trimmed_final);
                     }
-                    session_log.final_result(trimmed_final);
-                }
-                if args.verbose {
-                    eprintln!("[DEBUG] 主循环: 准备销毁并重建流");
+                    segment_id = segment_id.saturating_add(1);
                 }
                 // 绕过 sherpa-onnx 1.12.9 OnlineStreamReset 路径下的状态损坏：
                 // 直接销毁当前 OnlineStream，再用 recognizer 重新创建一个。
-                // 这样下一次 accept_waveform 走的是全新实例的干净状态。
+                // ten-vad 的 reset() 是独立的 C++ 对象调用，与 recognizer 流无关。
                 stream = recognizer.create_stream();
-                endpoint_detector.reset();
-                if args.verbose {
-                    eprintln!("[DEBUG] 主循环: 流已重建，检测器已重置");
-                }
-            }
-            if args.verbose {
-                eprintln!("[DEBUG] 主循环: 本次循环结束");
+                vad.reset();
+                // 重建流后，partial 也必须重新开始计数，否则 debounce 会错乱。
+                last_result.clear();
+                last_print_time = std::time::Instant::now();
             }
         }
+    }
+
+    // Ctrl+C 退出前 flush()，把已经推进去但还没切完的样本里残余 segment 排出来，
+    // 避免最后一段说到一半被丢弃。
+    vad.flush();
+    let drained = drain_segments(&vad);
+    let drained_count = drained.len();
+    for seg in drained {
+        let final_result = recognizer.get_result(&stream);
+        let trimmed_final = final_result.trim();
+        let duration_ms = (seg.samples.len() as u64 * 1000)
+            / (vad_cfg.sample_rate as u64).max(1);
+        session_log.endpoint_detected(&SegmentCommitInfo {
+            segment_id,
+            start_sample: seg.start,
+            samples: seg.samples.len() as u32,
+            duration_ms,
+        });
+        if !trimmed_final.is_empty() {
+            print_final(trimmed_final, stdout_is_tty);
+            // 循环已退出，不再打印 partial，last_printed 不再被读取。
+            last_printed = trimmed_final.to_string();
+            last_committed_final = trimmed_final.to_string();
+            session_log.final_result(trimmed_final);
+        }
+        segment_id = segment_id.saturating_add(1);
+    }
+
+    // 兜底：vad 没切出任何 segment（min_silence 阈值未达到、用户 Ctrl+C 太急），
+    // 但屏幕 / partial 日志里已经有最后一段文本（last_printed）。
+    // 这种情况下 partial 事件被记录了，但 final 事件缺失 —— 用 last_printed 兜一条 final，
+    // 原则：用户主动 Ctrl+C，模型识别了多少就 commit 多少，不丢。
+    //
+    // 触发条件：
+    // - drained_count == 0（vad 队列空）
+    // - last_printed != last_committed_final（有未提交的已打印文本）
+    if drained_count == 0 && !last_printed.is_empty() && last_printed != last_committed_final {
+        session_log.final_result(&last_printed);
+        eprintln!(
+            "[INFO] Ctrl+C 时 vad 未切段，兜底提交 last_printed（{} 字符）",
+            last_printed.chars().count()
+        );
     }
 
     session_log.session_end(SessionEndReason::CtrlC);
     Ok(())
 }
 
-/// 读出当前 endpoint_detector 的语音/静音累计时长（毫秒）。
-/// EndpointDetector 把这两个值封装在私有字段里，所以这里只能走 accept_waveform
-/// 之后的内部状态：speech_samples 表示累计语音样本数，silence_samples 表示
-/// 累计静音样本数（reset 后从 0 开始累加）。
-fn endpoint_snapshot(d: &EndpointDetector) -> (u64, u64) {
-    let sr = d.sample_rate() as u64;
-    let speech_samples = d.speech_samples() as u64;
-    let silence_samples = d.silence_samples() as u64;
-    let speech_ms = if sr == 0 { 0 } else { speech_samples * 1000 / sr };
-    let silence_ms = if sr == 0 { 0 } else { silence_samples * 1000 / sr };
-    (speech_ms, silence_ms)
+/// 流式 partial 输出。TTY 下走就地覆盖（`\r` + ANSI erase-line），piped 下
+/// 走普通 println，避免污染下游消费者。
+///
+/// ANSI 说明：
+/// - `\r`：把光标移到行首
+/// - `\x1b[2K`：擦除整行（包括光标右侧所有字符），保证新文本较短时不会残留
+/// - `▌ {text}`：左侧细条 + 文本，是常见的"流式中"前缀符号
+fn print_partial(text: &str, tty: bool) {
+    if tty {
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\r\x1b[2K▌ {}", text);
+        let _ = out.flush();
+    } else {
+        println!("{}", text);
+    }
+}
+
+/// endpoint 最终结果。TTY 下覆盖上一行 partial（如果有）并以 `\n` 提交本行，
+/// 这样下一句 partial 会从新行开始，避免 partial 与 final 串行错位。
+/// piped 下保留 `\n✅ ` 前缀风格，让 grep / awk 等下游工具更易识别。
+fn print_final(text: &str, tty: bool) {
+    if tty {
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\r\x1b[2K✅ {}\n", text);
+        let _ = out.flush();
+    } else {
+        println!("\n✅ {}", text);
+    }
 }

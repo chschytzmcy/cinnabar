@@ -313,18 +313,48 @@ num_threads: 2,  // 从 4 改为 2
 
 ### 问题：句子分割不准确
 
-**说明**：当前使用 VAD + 静音检测（v1.2.3+）
+**说明**：自 v1.2.4 起，VAD 已从能量阈值升级到 sherpa-onnx 的 **ten-vad**（神经网络 VAD，由声网开源），不再使用 `EndpointDetector`。
 
-**调整参数**（编辑 `src/main.rs`）：
-```rust
-// 调整 endpoint 检测参数
-let mut endpoint_detector = EndpointDetector::new(
-    0.01,  // VAD 阈值（降低以提高灵敏度）
-    16000, // 采样率
-    1.2,   // 最小静音时长（秒）
-    0.5,   // 最小语音时长（秒）
-);
+**调整参数**（编辑 `config.toml` 或用 CLI flag 覆盖）：
+```toml
+# 提高灵敏度（更激进地判定为语音）：
+vad_threshold = 0.3
+
+# 缩短切 segment 所需的最长静音（更早断句）：
+vad_min_silence_ms = 700
+
+# 拉长最短语音长度（过滤掉更短的爆破音）：
+vad_min_speech_ms = 700
 ```
+
+CLI 覆盖示例：
+```bash
+cinnabar --vad-threshold 0.3 --vad-min-silence-ms 700
+```
+
+调整后查看 JSONL 日志里 `endpoint` 事件的 `duration_ms` 字段，确认切段时机是否符合预期。
+
+### 问题：ten-vad 模型缺失
+
+`VoiceActivityDetector` 创建失败，报错 `创建 ten-vad VoiceActivityDetector 失败（检查 --vad-model ...）`。
+
+**解决**：
+```bash
+./setup_models.sh    # 会下载 ./models/ten-vad.onnx（约 324 KB）
+ls -lh ./models/     # 确认 ten-vad.onnx 存在
+```
+
+或自定义路径：
+```bash
+cinnabar --vad-model /path/to/your/ten-vad.onnx
+```
+
+### 问题：ten-vad 阈值过高/过低
+
+- 阈值太高（>0.7）：很多真实语音被判为静音，整句丢失。**降低** `vad_threshold` 到 0.3-0.5。
+- 阈值太低（<0.2）：风扇、咳嗽声被误判为语音，segment 切得太碎。**提高** `vad_threshold` 到 0.5-0.7。
+
+注意：ten-vad 的 threshold 是**概率**（0.0-1.0），不是早期能量 VAD 时代的能量值 0.01，**两者不可类比**。
 
 ---
 

@@ -1,40 +1,61 @@
 #!/bin/bash
 
+# 下载 Cinnabar 需要的全部模型：ASR（paraformer）+ VAD（ten-vad）。
+# 每个文件按存在性判断是否下载 —— `./models` 目录保留，不会被整体删除。
+
 set -e
 
-MODEL_NAME="sherpa-onnx-streaming-paraformer-bilingual-zh-en"
-MODEL_VERSION="1.10.0"
-MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${MODEL_NAME}.tar.bz2"
+ASR_MODEL_NAME="sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+ASR_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${ASR_MODEL_NAME}.tar.bz2"
+VAD_MODEL_NAME="ten-vad.onnx"
+VAD_MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${VAD_MODEL_NAME}"
 MODEL_DIR="./models"
+TMP_DIR="$(mktemp -d)"
+
+cleanup() {
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
 
 echo "🔥 Cinnabar Model Setup"
-echo "Downloading: ${MODEL_NAME}"
+echo "Target directory: ${MODEL_DIR}"
 echo ""
-
-if [ -d "${MODEL_DIR}" ]; then
-    echo "⚠️  Model directory already exists. Removing..."
-    rm -rf "${MODEL_DIR}"
-fi
 
 mkdir -p "${MODEL_DIR}"
 
-echo "📥 Downloading model..."
-wget -q --show-progress "${MODEL_URL}" -O /tmp/model.tar.bz2
+# ---- ASR 模型 ----
+need_asr=0
+for f in encoder.int8.onnx decoder.int8.onnx tokens.txt; do
+    if [ ! -f "${MODEL_DIR}/${f}" ]; then
+        need_asr=1
+        break
+    fi
+done
 
-echo "📦 Extracting model..."
-tar -xjf /tmp/model.tar.bz2 -C /tmp/
+if [ "${need_asr}" -eq 1 ]; then
+    echo "📥 Downloading ASR model: ${ASR_MODEL_NAME}"
+    wget -q --show-progress "${ASR_MODEL_URL}" -O "${TMP_DIR}/model.tar.bz2"
+    echo "📦 Extracting ASR model..."
+    tar -xjf "${TMP_DIR}/model.tar.bz2" -C "${TMP_DIR}/"
+    # 把解压目录里的所有 *.onnx + tokens.txt 拷到 MODEL_DIR（不动用户自放文件）
+    cp -n "${TMP_DIR}/${ASR_MODEL_NAME}"/*.onnx "${MODEL_DIR}/" 2>/dev/null || true
+    cp -n "${TMP_DIR}/${ASR_MODEL_NAME}/tokens.txt" "${MODEL_DIR}/" 2>/dev/null || true
+    echo "✅ ASR model installed."
+else
+    echo "✅ ASR model already present, skipping."
+fi
 
-echo "📂 Moving model files..."
-mv /tmp/${MODEL_NAME}/*.onnx "${MODEL_DIR}/"
-mv /tmp/${MODEL_NAME}/tokens.txt "${MODEL_DIR}/"
-
-echo "🧹 Cleaning up..."
-rm -rf /tmp/model.tar.bz2 /tmp/${MODEL_NAME}
+# ---- ten-vad 模型 ----
+if [ ! -f "${MODEL_DIR}/${VAD_MODEL_NAME}" ]; then
+    echo "📥 Downloading ten-vad model..."
+    wget -q --show-progress "${VAD_MODEL_URL}" -O "${MODEL_DIR}/${VAD_MODEL_NAME}"
+    echo "✅ ten-vad model installed."
+else
+    echo "✅ ten-vad model already present, skipping."
+fi
 
 echo ""
-echo "✅ Model setup complete!"
-echo ""
-echo "Required files:"
+echo "📂 Models in ${MODEL_DIR}:"
 ls -lh "${MODEL_DIR}"
 
 echo ""

@@ -102,6 +102,52 @@ pub struct SherpaOnnxOnlineRecognizerResult {
     pub json: *const c_char,
 }
 
+// --- VAD 配置结构（vendored c-api.h:832-888）---
+// ten-vad 路径当前 vendored 库的唯一推荐选项；silero_vad 槽位保留但运行时置 null。
+// 注：C 头文件全部使用 `*const` 而非 `*mut`，保持 API 对称。
+
+#[repr(C)]
+pub struct SherpaOnnxSileroVadModelConfig {
+    pub model: *const c_char,
+    pub threshold: c_float,
+    pub min_silence_duration: c_float,
+    pub min_speech_duration: c_float,
+    pub window_size: c_int,
+    pub max_speech_duration: c_float,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxTenVadModelConfig {
+    pub model: *const c_char,
+    pub threshold: c_float,
+    pub min_silence_duration: c_float,
+    pub min_speech_duration: c_float,
+    pub window_size: c_int,
+    pub max_speech_duration: c_float,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxVadModelConfig {
+    pub silero_vad: SherpaOnnxSileroVadModelConfig,
+    pub sample_rate: c_int,
+    pub num_threads: c_int,
+    pub provider: *const c_char,
+    pub debug: c_int,
+    pub ten_vad: SherpaOnnxTenVadModelConfig,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxSpeechSegment {
+    pub start: c_int,
+    pub samples: *mut c_float,
+    pub n: c_int,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxVoiceActivityDetector {
+    _private: [u8; 0],
+}
+
 #[allow(dead_code)]
 #[link(name = "sherpa-onnx-c-api")]
 extern "C" {
@@ -144,6 +190,45 @@ extern "C" {
     pub fn SherpaOnnxOnlineStreamIsEndpoint(stream: *mut SherpaOnnxOnlineStream) -> c_int;
 
     pub fn SherpaOnnxOnlineStreamReset(stream: *mut SherpaOnnxOnlineStream);
+
+    // --- VoiceActivityDetector（ten-vad / silero-vad 通用）---
+    // 11 个 C 函数 + 1 个 segment 析构函数。
+    pub fn SherpaOnnxCreateVoiceActivityDetector(
+        config: *const SherpaOnnxVadModelConfig,
+        buffer_size_in_seconds: c_float,
+    ) -> *const SherpaOnnxVoiceActivityDetector;
+
+    pub fn SherpaOnnxDestroyVoiceActivityDetector(
+        p: *const SherpaOnnxVoiceActivityDetector,
+    );
+
+    pub fn SherpaOnnxVoiceActivityDetectorAcceptWaveform(
+        p: *const SherpaOnnxVoiceActivityDetector,
+        samples: *const c_float,
+        n: c_int,
+    );
+
+    pub fn SherpaOnnxVoiceActivityDetectorEmpty(
+        p: *const SherpaOnnxVoiceActivityDetector,
+    ) -> c_int;
+
+    pub fn SherpaOnnxVoiceActivityDetectorDetected(
+        p: *const SherpaOnnxVoiceActivityDetector,
+    ) -> c_int;
+
+    pub fn SherpaOnnxVoiceActivityDetectorPop(p: *const SherpaOnnxVoiceActivityDetector);
+
+    pub fn SherpaOnnxVoiceActivityDetectorClear(p: *const SherpaOnnxVoiceActivityDetector);
+
+    pub fn SherpaOnnxVoiceActivityDetectorFront(
+        p: *const SherpaOnnxVoiceActivityDetector,
+    ) -> *const SherpaOnnxSpeechSegment;
+
+    pub fn SherpaOnnxDestroySpeechSegment(p: *const SherpaOnnxSpeechSegment);
+
+    pub fn SherpaOnnxVoiceActivityDetectorReset(p: *const SherpaOnnxVoiceActivityDetector);
+
+    pub fn SherpaOnnxVoiceActivityDetectorFlush(p: *const SherpaOnnxVoiceActivityDetector);
 }
 
 pub struct OnlineRecognizer {
@@ -337,6 +422,168 @@ impl Drop for OnlineStream {
     fn drop(&mut self) {
         unsafe {
             SherpaOnnxDestroyOnlineStream(self.stream);
+        }
+    }
+}
+
+// ============================================================================
+// VoiceActivityDetector —— sherpa-onnx 1.12.9 的 VAD 包装
+// ============================================================================
+//
+// 设计要点：
+// - 持有 *const 句柄（与 C 头文件对称），以及两个 owned CString 保证 model path
+//   与 provider 字符串的内存活得比 C 端调用更久（OnlineRecognizer 同款模式）。
+// - front() 在 DestroySpeechSegment 之前把 samples 拷进 owned Vec<f32>，避免
+//   LTO 下把拷贝推迟到 free 之后而踩悬空指针（参照 get_result 的修复模式）。
+// - flush() 在 Ctrl+C 退出前调用，把已入队但还没切完的 segment 排出来。
+
+#[derive(Clone, Debug)]
+pub struct SpeechSegment {
+    pub start: i32,
+    pub samples: Vec<f32>,
+}
+
+pub struct VoiceActivityDetector {
+    vad: *const SherpaOnnxVoiceActivityDetector,
+    _model_path: CString,
+    _provider: CString,
+}
+
+unsafe impl Send for VoiceActivityDetector {}
+unsafe impl Sync for VoiceActivityDetector {}
+
+impl VoiceActivityDetector {
+    pub fn new(
+        model_path: &str,
+        threshold: f32,
+        min_silence_duration: f32,
+        min_speech_duration: f32,
+        window_size: i32,
+        max_speech_duration: f32,
+        sample_rate: i32,
+        num_threads: i32,
+        provider: &str,
+        buffer_size_in_seconds: f32,
+    ) -> anyhow::Result<Self> {
+        unsafe {
+            let model_c = CString::new(model_path)
+                .map_err(|e| anyhow::anyhow!("model_path 含 NUL: {}", e))?;
+            let provider_c = CString::new(provider)
+                .map_err(|e| anyhow::anyhow!("provider 含 NUL: {}", e))?;
+
+            let config = SherpaOnnxVadModelConfig {
+                // silero 槽位留空：本项目只用 ten-vad。
+                silero_vad: SherpaOnnxSileroVadModelConfig {
+                    model: ptr::null(),
+                    threshold: 0.0,
+                    min_silence_duration: 0.0,
+                    min_speech_duration: 0.0,
+                    window_size: 0,
+                    max_speech_duration: 0.0,
+                },
+                sample_rate,
+                num_threads,
+                provider: provider_c.as_ptr(),
+                debug: 0,
+                ten_vad: SherpaOnnxTenVadModelConfig {
+                    model: model_c.as_ptr(),
+                    threshold,
+                    min_silence_duration,
+                    min_speech_duration,
+                    window_size,
+                    max_speech_duration,
+                },
+            };
+
+            let vad = SherpaOnnxCreateVoiceActivityDetector(&raw const config, buffer_size_in_seconds);
+            if vad.is_null() {
+                anyhow::bail!(
+                    "创建 ten-vad VoiceActivityDetector 失败（检查模型路径: {}）",
+                    model_path
+                );
+            }
+
+            Ok(Self {
+                vad,
+                _model_path: model_c,
+                _provider: provider_c,
+            })
+        }
+    }
+
+    pub fn accept_waveform(&self, samples: &[f32]) {
+        unsafe {
+            SherpaOnnxVoiceActivityDetectorAcceptWaveform(
+                self.vad,
+                samples.as_ptr(),
+                samples.len() as c_int,
+            );
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        unsafe { SherpaOnnxVoiceActivityDetectorEmpty(self.vad) != 0 }
+    }
+
+    /// 当前是否有语音正在被检测到（per-frame "is currently speech"）。
+    /// 等价于原 VadDetector::is_speech 的语义，但由 ten-vad 内部状态驱动。
+    #[allow(dead_code)]
+    pub fn is_speech_detected(&self) -> bool {
+        unsafe { SherpaOnnxVoiceActivityDetectorDetected(self.vad) != 0 }
+    }
+
+    /// 取第一个 segment 并把 samples 拷成 owned Vec。
+    /// 关键：c-api 的 Front() 在 C++ 侧 `new[]` 了 samples 数组，
+    /// 我们必须在 DestroySpeechSegment 之前完成拷贝，否则 LTO 下会读到 free 后的内存。
+    /// 调用方必须先用 `is_empty()` 检查，否则 seg 为 null 是 UB。
+    pub fn front(&self) -> SpeechSegment {
+        unsafe {
+            let seg = SherpaOnnxVoiceActivityDetectorFront(self.vad);
+            assert!(
+                !seg.is_null(),
+                "VoiceActivityDetector::front() 在 is_empty() 时是 UB"
+            );
+            let start = (*seg).start;
+            let n = (*seg).n as usize;
+            let mut samples = vec![0.0f32; n];
+            if n > 0 {
+                ptr::copy_nonoverlapping((*seg).samples, samples.as_mut_ptr(), n);
+            }
+            SherpaOnnxDestroySpeechSegment(seg);
+            SpeechSegment { start, samples }
+        }
+    }
+
+    pub fn pop(&self) {
+        unsafe {
+            SherpaOnnxVoiceActivityDetectorPop(self.vad);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&self) {
+        unsafe {
+            SherpaOnnxVoiceActivityDetectorClear(self.vad);
+        }
+    }
+
+    pub fn reset(&self) {
+        unsafe {
+            SherpaOnnxVoiceActivityDetectorReset(self.vad);
+        }
+    }
+
+    pub fn flush(&self) {
+        unsafe {
+            SherpaOnnxVoiceActivityDetectorFlush(self.vad);
+        }
+    }
+}
+
+impl Drop for VoiceActivityDetector {
+    fn drop(&mut self) {
+        unsafe {
+            SherpaOnnxDestroyVoiceActivityDetector(self.vad);
         }
     }
 }

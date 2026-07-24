@@ -2,7 +2,8 @@ use super::hotkey::HotkeyManager;
 use super::state::{AppState, StateManager};
 use crate::ffi::OnlineStream;
 use crate::injector::TextInjector;
-use crate::recognizer::RecognizerEngine;
+use crate::recognizer::{ProcessOutcome, RecognizerEngine};
+use crate::vad::VadConfig;
 use crate::wayland;
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,15 @@ pub struct CinnabarWindow {
 impl CinnabarWindow {
     /// 创建新的悬浮窗实例
     pub fn new(_cc: &eframe::CreationContext<'_>, model_dir: &std::path::Path) -> Self {
-        let mut recognizer = RecognizerEngine::new(model_dir, None, None).ok();
+        // GUI 也走 ten-vad：构造默认 VadConfig，路径相对 model_dir。
+        let mut vad_cfg = VadConfig::default();
+        vad_cfg.model_path = model_dir
+            .join("ten-vad.onnx")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut recognizer =
+            RecognizerEngine::new(model_dir, None, None, vad_cfg).ok();
 
         if let Some(ref mut r) = recognizer {
             r.start();
@@ -71,37 +80,33 @@ impl eframe::App for CinnabarWindow {
             if let (Some(ref mut recognizer), Some(ref mut stream)) =
                 (&mut self.recognizer, &mut self.stream)
             {
-                if let Some(text) = recognizer.process(stream) {
-                    let state_manager = self.state_manager.lock().unwrap();
-                    state_manager.set_text(text.clone());
-                    state_manager.set_state(AppState::Recognizing);
-                    drop(state_manager);
-
-                    // 检测句子结束
-                    if text.ends_with('。')
-                        || text.ends_with('？')
-                        || text.ends_with('！')
-                        || text.ends_with('.')
-                        || text.ends_with('?')
-                        || text.ends_with('!')
-                    {
-                        self.state_manager
-                            .lock()
-                            .unwrap()
-                            .set_state(AppState::Injecting);
+                // ten-vad 决定何时结束 segment；不再用标点符号触发。
+                match recognizer.process(stream) {
+                    ProcessOutcome::Idle => {}
+                    ProcessOutcome::Partial(text) => {
+                        let sm = self.state_manager.lock().unwrap();
+                        sm.set_text(text);
+                        sm.set_state(AppState::Recognizing);
+                    }
+                    ProcessOutcome::SegmentEnded { text, segment_id: _ } => {
+                        let sm = self.state_manager.lock().unwrap();
+                        sm.set_text(text.clone());
+                        sm.set_state(AppState::Injecting);
+                        drop(sm);
 
                         // 注入文本
                         if let Some(ref mut injector) = self.injector {
                             let _ = injector.paste_text(&text);
                         }
 
-                        // 重置 endpoint 检测器
-                        recognizer.reset_endpoint();
+                        // 绕开 sherpa-onnx 1.12.9 reset 崩溃：销毁并重建 ASR 流。
+                        *stream = recognizer.create_stream();
+                        recognizer.reset_vad();
 
                         // 返回待机状态
-                        let state_manager = self.state_manager.lock().unwrap();
-                        state_manager.set_state(AppState::Idle);
-                        state_manager.clear_text();
+                        let sm = self.state_manager.lock().unwrap();
+                        sm.set_state(AppState::Idle);
+                        sm.clear_text();
                     }
                 }
             }

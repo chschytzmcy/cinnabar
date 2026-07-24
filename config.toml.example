@@ -1,10 +1,35 @@
 # Cinnabar 配置文件示例
+# 任何字段都可以省略，serde 会用各字段的默认函数回填。
 
-# 模型目录路径
+# 模型目录路径（包含 ASR encoder/decoder ONNX 与 tokens.txt）
 model_dir = "./models"
 
-# VAD 阈值（0.0-1.0，越高越严格）
-vad_threshold = 0.01
+# ===== ten-vad 配置 =====
+# ten-vad 模型文件路径（由 ./setup_models.sh 下载）
+vad_model_path = "./models/ten-vad.onnx"
 
+# ten-vad 语音概率阈值 0.0-1.0，越高越严格（仅在置信度高时才判为语音）。
+# 与早期能量 VAD 的 0.01 不可类比 —— 现在是神经网络输出概率。
+vad_threshold = 0.5
+
+# 持续静音多久后切 segment（毫秒）
+vad_min_silence_ms = 1200
+
+# 多短的语音才视为有效 segment（毫秒）
+vad_min_speech_ms = 500
+
+# ten-vad 推理窗口大小（样本数）。16kHz 下 256 = 16ms；512 / 768 也合法。
+vad_window_size = 256
+
+# 单个 segment 最长多少秒，超过会被强制切断
+vad_max_speech_duration = 20.0
+
+# onnxruntime 推理线程数
+vad_num_threads = 2
+
+# 执行 provider（"cpu" / "cuda" / "coreml"）
+vad_provider = "cpu"
+
+# ===== GUI 字段 =====
 # 热键设置（支持 F3, F4 等）
 hotkey = "F3"

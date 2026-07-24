@@ -69,20 +69,30 @@ impl SessionLog {
     }
 
     /// 流式 partial 结果。`seq` 自增，便于乱序/丢失分析。
-    pub fn partial(&mut self, seq: u64, text: &str, samples_so_far: u64) {
+    ///
+    /// `printed` 字段区分两种事件：
+    /// - `false`：ASR 解码出文本那一刻落盘（即便后续节流期内不再变化）
+    /// - `true`：节流窗口到点、文本真的打印到屏幕那一刻落盘
+    ///
+    /// 这条区分让事后能看出"模型识别的轨迹"和"用户看到的轨迹"差异。
+    pub fn partial(&mut self, seq: u64, text: &str, samples_so_far: u64, printed: bool) {
         self.emit(&LogEvent::Partial {
             ts_ms: now_ms(),
             seq,
             text: text.to_string(),
             samples_so_far,
+            printed,
         });
     }
 
-    pub fn endpoint_detected(&mut self, speech_ms: u64, silence_ms: u64) {
+    /// ten-vad 切出的 segment 被 commit 时记录。
+    /// `segment_id` 是本次会话内 segment 的自增编号；
+    /// `start_sample` 是 ten-vad 给出的相对 16 kHz buffer 起点；
+    /// `duration_ms` = `seg.samples.len() * 1000 / sample_rate`。
+    pub fn endpoint_detected(&mut self, info: &SegmentCommitInfo) {
         self.emit(&LogEvent::Endpoint {
             ts_ms: now_ms(),
-            speech_ms,
-            silence_ms,
+            info: info.clone(),
         });
     }
 
@@ -120,9 +130,18 @@ pub struct SessionStartInfo {
     pub sample_rate: u32,
     pub channels: u16,
     pub resampled: bool,
+    pub vad_model_path: String,
     pub vad_threshold: f32,
     pub min_silence_ms: u32,
     pub min_speech_ms: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SegmentCommitInfo {
+    pub segment_id: u64,
+    pub start_sample: i32,
+    pub samples: u32,
+    pub duration_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -147,11 +166,11 @@ enum LogEvent {
         seq: u64,
         text: String,
         samples_so_far: u64,
+        printed: bool,
     },
     Endpoint {
         ts_ms: u64,
-        speech_ms: u64,
-        silence_ms: u64,
+        info: SegmentCommitInfo,
     },
     Final {
         ts_ms: u64,
