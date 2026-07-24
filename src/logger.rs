@@ -106,12 +106,24 @@ impl SessionLog {
 
     /// 离线 ASR refine 覆盖事件 —— 流式 final 出炉后再被非流式精修时记录。
     /// `streaming_text` 是屏幕上先打印的版本，`refined_text` 是非流式覆盖后的版本。
-    /// 两者一致时也记（用于复盘"精修没改字"的比例）。
-    pub fn refine(&mut self, streaming_text: &str, refined_text: &str) {
+    /// `score` 是综合精修评分（字符 multiset Jaccard × 长度比 × 前缀匹配），0-1。
+    /// `decision` 三档：
+    /// - `"override"`        — score >= 0.85，覆盖屏幕
+    /// - `"override_warn"`   — 0.40 <= score < 0.85，覆盖但日志标 warn
+    /// - `"rejected"`        — score < 0.40，**不覆盖**，保留流式结果
+    pub fn refine(
+        &mut self,
+        streaming_text: &str,
+        refined_text: &str,
+        score: f32,
+        decision: &str,
+    ) {
         self.emit(&LogEvent::Refine {
             ts_ms: now_ms(),
             streaming_text: streaming_text.to_string(),
             refined_text: refined_text.to_string(),
+            score,
+            decision: decision.to_string(),
         });
     }
 
@@ -191,6 +203,8 @@ enum LogEvent {
         ts_ms: u64,
         streaming_text: String,
         refined_text: String,
+        score: f32,
+        decision: String,
     },
     #[allow(dead_code)]
     Warn {
