@@ -421,6 +421,15 @@ let recognizer = OnlineRecognizer::new(
             // 先于 partial 打印之前调用，避免 partial 还没刷出来就被 final 覆盖掉。
             vad.accept_waveform(&samples_16k);
 
+            // ten-vad 的 flush() 强制吐出 pending segment。
+            // 长静音时（用户停顿 > min_silence_ms），ten-vad 内部状态机不会自然 emit
+            // 段，必须手动 flush 触发。否则用户停顿时 VAD 不会自动 commit final，
+            // 必须 Ctrl+C 才能 commit（退回到 last_printed 兜底逻辑，丢失准确率）。
+            // 调用条件：当前帧是静音（即 is_speech_detected == false），避免频繁调。
+            if !vad.is_speech_detected() {
+                vad.flush();
+            }
+
             while recognizer.is_ready(&stream) {
                 recognizer.decode(&mut stream);
             }
