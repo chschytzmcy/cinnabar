@@ -30,6 +30,27 @@ vad_num_threads = 2
 # 执行 provider（"cpu" / "cuda" / "coreml"）
 vad_provider = "cpu"
 
+# ===== 离线 ASR refine 配置 =====
+# 流式 partial 立即给屏幕上的 ✅ 流式文本；VAD 切段后另启非流式 ASR
+# 精修整段音频，~200ms 内覆盖该行。纯流式 → 把 enable_offline_refine
+# 设为 false 即可，命令行 --no-offline-refine 也能临时关。
+
+# 离线 Zipformer CTC 模型（中文 int8，AISHELL WER 1.74%）
+offline_model_path = "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx"
+offline_tokens_path = "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt"
+
+# onnxruntime 推理线程数（Zipformer CTC 单线程也快，2 够用）
+offline_num_threads = 2
+
+# 执行 provider（"cpu" / "cuda" / "coreml"）
+offline_provider = "cpu"
+
+# 解码方法：Zipformer CTC greedy_search 最快最稳；beam 增益极小
+offline_decoding = "greedy_search"
+
+# 是否启用离线精修。设为 false 时退回纯流式（更省内存 / 老 CPU 推荐）。
+enable_offline_refine = true
+
 # ===== GUI 字段 =====
 # 热键设置（支持 F3, F4 等）
 hotkey = "F3"

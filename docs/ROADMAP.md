@@ -84,6 +84,12 @@ Cinnabar 支持两种运行模式：
 - [x] 替代 sherpa-onnx 的不稳定 is_endpoint
 - [x] 升级到 ten-vad（神经网络 VAD）   ← v1.2.4，对噪声鲁棒、不依赖麦克风增益
 
+**离线 ASR 精修**：✅
+- [x] 流式 + 非流式并行加载   ← v1.2.5
+- [x] VAD 切段后非流式覆盖屏幕 final（CER 降 2-5 pp）
+- [x] 关闭开关 `--no-offline-refine` / `enable_offline_refine = false`
+- [x] 兜底：非流式模型缺失时优雅退回纯流式
+
 **配置管理**：✅
 - [x] 配置文件支持（TOML）
 - [x] 保存用户偏好设置

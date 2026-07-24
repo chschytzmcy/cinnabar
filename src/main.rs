@@ -13,7 +13,7 @@ use clap::Parser;
 use config::Config;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::bounded;
-use ffi::OnlineRecognizer;
+use ffi::{OfflineRecognizer, OnlineRecognizer};
 use logger::{SegmentCommitInfo, SessionEndReason, SessionLog, SessionStartInfo};
 use resampler::LinearResampler;
 use std::io::{IsTerminal, Write};
@@ -74,6 +74,23 @@ pub struct Args {
     /// ten-vad 视语音有效所需的最短时长（毫秒）；覆盖 config.toml。
     #[arg(long)]
     vad_min_speech_ms: Option<u32>,
+
+    // --- 非流式 ASR refine ---
+    /// 禁用离线 ASR 精修（退回纯流式，节省 ~300MB 内存）。
+    #[arg(long)]
+    no_offline_refine: bool,
+
+    /// 非流式 Zipformer CTC 模型路径；覆盖 config.toml。
+    #[arg(long)]
+    offline_model: Option<String>,
+
+    /// 非流式 tokens.txt 路径；覆盖 config.toml。
+    #[arg(long)]
+    offline_tokens: Option<String>,
+
+    /// 非流式推理线程数；覆盖 config.toml。
+    #[arg(long)]
+    offline_threads: Option<i32>,
 }
 
 fn main() -> Result<()> {
@@ -112,6 +129,22 @@ fn main() -> Result<()> {
     if let Some(s) = args.vad_min_speech_ms {
         vad_cfg.min_speech_ms = s;
     }
+
+    // 合并 OfflineRecognizer 配置：CLI > 文件 > 默认
+    let offline_model_path = args
+        .offline_model
+        .clone()
+        .unwrap_or_else(|| file_config.offline_model_path.clone());
+    let offline_tokens_path = args
+        .offline_tokens
+        .clone()
+        .unwrap_or_else(|| file_config.offline_tokens_path.clone());
+    let offline_num_threads = args
+        .offline_threads
+        .unwrap_or(file_config.offline_num_threads);
+    let offline_provider = file_config.offline_provider.clone();
+    let offline_decoding = file_config.offline_decoding.clone();
+    let enable_offline_refine = !args.no_offline_refine && file_config.enable_offline_refine;
 
     // 流式日志：尽早打开，CLI 列表设备阶段也记 session_start 以便事后追溯
     let mut session_log = SessionLog::open(args.log_file.as_deref())
@@ -283,6 +316,35 @@ fn main() -> Result<()> {
         .build()
         .context("创建 ten-vad VoiceActivityDetector 失败（检查 --vad-model 路径）")?;
 
+    // 非流式 ASR（Zipformer CTC 中文 int8）：用于切段后的精修。
+    // 加载失败 / 配置关闭时为 None，主循环里跳过 refine 走纯流式。
+    let offline: Option<OfflineRecognizer> = if enable_offline_refine {
+        match OfflineRecognizer::new(
+            &offline_model_path,
+            &offline_tokens_path,
+            offline_num_threads,
+            &offline_provider,
+            &offline_decoding,
+        ) {
+            Ok(r) => {
+                eprintln!(
+                    "🔧 非流式 ASR 已加载（Zipformer CTC，refine 开启；~+200ms 延迟）"
+                );
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️  非流式 ASR 加载失败，退回纯流式：{}",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        eprintln!("ℹ️  非流式 refine 已禁用（--no-offline-refine 或 config.toml）");
+        None
+    };
+
     // 流式输出状态：
     // - last_result：ASR 最近一次识别的文本
     // - last_printed：屏幕上/管道里最后一次出现的文本（避免重复输出）
@@ -386,6 +448,33 @@ fn main() -> Result<()> {
                         last_printed = trimmed_final.to_string();
                         last_committed_final = trimmed_final.to_string();
                         session_log.final_result(trimmed_final);
+
+                        // 非流式 ASR 精修：~200ms 内出结果，覆盖屏幕上的流式 final。
+                        // 紧跟 print_final 立即调用，期间不能有其它 stdout 输出，
+                        // 否则 \x1b[1A 会覆盖错行。
+                        if let Some(ref off) = offline {
+                            match refine_segment(off, &seg.samples, target_sample_rate as i32) {
+                                Ok(refined) if !refined.is_empty() => {
+                                    if refined != trimmed_final {
+                                        print_final_replace(&refined, stdout_is_tty);
+                                        last_printed = refined.clone();
+                                        last_committed_final = refined.clone();
+                                    }
+                                    session_log.refine(trimmed_final, &refined);
+                                }
+                                Ok(_) => {
+                                    // refine 返回空字符串：罕见，记 warn 但不阻塞
+                                    if args.verbose {
+                                        eprintln!("[DEBUG] 非流式 refine 返回空文本，跳过覆盖");
+                                    }
+                                }
+                                Err(e) => {
+                                    if args.verbose {
+                                        eprintln!("[DEBUG] 非流式 refine 失败：{}", e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     segment_id = segment_id.saturating_add(1);
                 }
@@ -423,6 +512,20 @@ fn main() -> Result<()> {
             last_printed = trimmed_final.to_string();
             last_committed_final = trimmed_final.to_string();
             session_log.final_result(trimmed_final);
+
+            // 退出路径上的 refine：跟行内 commit 同样的逻辑
+            if let Some(ref off) = offline {
+                if let Ok(refined) =
+                    refine_segment(off, &seg.samples, target_sample_rate as i32)
+                {
+                    if !refined.is_empty() && refined != trimmed_final {
+                        print_final_replace(&refined, stdout_is_tty);
+                        last_printed = refined.clone();
+                        last_committed_final = refined.clone();
+                    }
+                    session_log.refine(trimmed_final, &refined);
+                }
+            }
         }
         segment_id = segment_id.saturating_add(1);
     }
@@ -475,4 +578,42 @@ fn print_final(text: &str, tty: bool) {
     } else {
         println!("\n✅ {}", text);
     }
+}
+
+/// 覆盖刚刚由 `print_final` 写出的那行（用 `\x1b[1A` 上移一行）。
+///
+/// 注意：**必须紧跟 `print_final` 调用**，中间不能有任何 stdout / eprintln 输出，
+/// 否则光标已经移走，\x1b[1A 会覆盖到错误的位置。
+///
+/// ANSI 序列：
+/// - `\x1b[1A`：光标上移一行（从 print_final 末尾的 `\n` 回到 ✅ 行）
+/// - `\r`：回行首
+/// - `\x1b[2K`：擦除整行
+/// - 然后写新的 `✅ {text}\n`
+fn print_final_replace(text: &str, tty: bool) {
+    if tty {
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\x1b[1A\r\x1b[2K✅ {}\n", text);
+        let _ = out.flush();
+    } else {
+        // piped 下没有"上一行"可覆盖，追加新行
+        println!("\n✅ {}", text);
+    }
+}
+
+/// 把一段音频喂给非流式 recognizer 拿精修文本。
+///
+/// 创建一条 OfflineStream、accept 一次、decode 一次、读 result。
+/// OfflineStream 在本函数返回前 drop，完整生命周期在栈上。
+/// 失败（accept/decode/get_result 任一阶段）返回 anyhow::Error，调用方跳过 refine。
+fn refine_segment(
+    offline: &OfflineRecognizer,
+    samples: &[f32],
+    sample_rate: i32,
+) -> Result<String> {
+    let mut stream = offline.create_stream();
+    stream.accept_waveform(sample_rate, samples);
+    stream.decode(offline);
+    let text = stream.get_result();
+    Ok(text)
 }

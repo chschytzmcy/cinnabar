@@ -148,6 +148,153 @@ pub struct SherpaOnnxVoiceActivityDetector {
     _private: [u8; 0],
 }
 
+// --- Offline recognizer 配置结构（vendored c-api.h:455-519）---
+// 离线 API 没有 while-ready 循环：accept 一次 → decode 一次 → get_result。
+// 句柄全部 `const *`（与 C 头文件一致），跟 online 现有 `*mut` 风格不一致
+// 但 ABI 必须按 C 头来。
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineLMConfig {
+    pub model: *const c_char,
+    pub scale: c_float,
+}
+
+// 占位：每个都按 c-api.h 实际字段写一遍（即使我们只用 Zipformer CTC），
+// 因为 SherpaOnnxOfflineModelConfig 把它们全部 inline 进来，缺一个 layout 就错。
+#[repr(C)]
+pub struct SherpaOnnxOfflineTransducerModelConfig {
+    pub encoder: *const c_char,
+    pub decoder: *const c_char,
+    pub joiner: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineParaformerModelConfig {
+    pub model: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineNemoEncDecCtcModelConfig {
+    pub model: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineWhisperModelConfig {
+    pub encoder: *const c_char,
+    pub decoder: *const c_char,
+    pub language: *const c_char,
+    pub task: *const c_char,
+    pub tail_paddings: c_int,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineTdnnModelConfig {
+    pub model: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineSenseVoiceModelConfig {
+    pub model: *const c_char,
+    pub language: *const c_char,
+    pub use_itn: c_int,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineMoonshineModelConfig {
+    pub preprocessor: *const c_char,
+    pub encoder: *const c_char,
+    pub uncached_decoder: *const c_char,
+    pub cached_decoder: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineFireRedAsrModelConfig {
+    pub encoder: *const c_char,
+    pub decoder: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineDolphinModelConfig {
+    pub model: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineZipformerCtcModelConfig {
+    pub model: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineCanaryModelConfig {
+    pub encoder: *const c_char,
+    pub decoder: *const c_char,
+    pub src_lang: *const c_char,
+    pub tgt_lang: *const c_char,
+    pub use_pnc: c_int,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineModelConfig {
+    pub transducer: SherpaOnnxOfflineTransducerModelConfig,
+    pub paraformer: SherpaOnnxOfflineParaformerModelConfig,
+    pub nemo_ctc: SherpaOnnxOfflineNemoEncDecCtcModelConfig,
+    pub whisper: SherpaOnnxOfflineWhisperModelConfig,
+    pub tdnn: SherpaOnnxOfflineTdnnModelConfig,
+    pub tokens: *const c_char,
+    pub num_threads: c_int,
+    pub debug: c_int,
+    pub provider: *const c_char,
+    pub model_type: *const c_char,
+    pub modeling_unit: *const c_char,
+    pub bpe_vocab: *const c_char,
+    pub telespeech_ctc: *const c_char,
+    pub sense_voice: SherpaOnnxOfflineSenseVoiceModelConfig,
+    pub moonshine: SherpaOnnxOfflineMoonshineModelConfig,
+    pub fire_red_asr: SherpaOnnxOfflineFireRedAsrModelConfig,
+    pub dolphin: SherpaOnnxOfflineDolphinModelConfig,
+    pub zipformer_ctc: SherpaOnnxOfflineZipformerCtcModelConfig,
+    pub canary: SherpaOnnxOfflineCanaryModelConfig,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineRecognizerConfig {
+    pub feat_config: SherpaOnnxFeatureConfig,
+    pub model_config: SherpaOnnxOfflineModelConfig,
+    pub lm_config: SherpaOnnxOfflineLMConfig,
+    pub decoding_method: *const c_char,
+    pub max_active_paths: c_int,
+    pub hotwords_file: *const c_char,
+    pub hotwords_score: c_float,
+    pub rule_fsts: *const c_char,
+    pub rule_fars: *const c_char,
+    pub blank_penalty: c_float,
+    pub hr: SherpaOnnxHomophoneReplacerConfig,
+}
+
+// 字段顺序：text, timestamps, count, tokens, tokens_arr, json, lang, emotion, event
+// 跟 online 不同（online 没有 lang/emotion/event），ABI 兼容必须严格按这个顺序
+#[repr(C)]
+pub struct SherpaOnnxOfflineRecognizerResult {
+    pub text: *const c_char,
+    pub timestamps: *const c_float,
+    pub count: c_int,
+    pub tokens: *const c_char,
+    pub tokens_arr: *const *const c_char,
+    pub json: *const c_char,
+    pub lang: *const c_char,
+    pub emotion: *const c_char,
+    pub event: *const c_char,
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineRecognizer {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct SherpaOnnxOfflineStream {
+    _private: [u8; 0],
+}
+
 #[allow(dead_code)]
 #[link(name = "sherpa-onnx-c-api")]
 extern "C" {
@@ -229,6 +376,43 @@ extern "C" {
     pub fn SherpaOnnxVoiceActivityDetectorReset(p: *const SherpaOnnxVoiceActivityDetector);
 
     pub fn SherpaOnnxVoiceActivityDetectorFlush(p: *const SherpaOnnxVoiceActivityDetector);
+
+    // --- Offline Recognizer（非流式，一次性 accept → decode → get_result）---
+    // 句柄按 C 头文件用 *const；没有 IsOfflineStreamReady（离线不需要）。
+    pub fn SherpaOnnxCreateOfflineRecognizer(
+        config: *const SherpaOnnxOfflineRecognizerConfig,
+    ) -> *const SherpaOnnxOfflineRecognizer;
+
+    pub fn SherpaOnnxDestroyOfflineRecognizer(
+        p: *const SherpaOnnxOfflineRecognizer,
+    );
+
+    pub fn SherpaOnnxCreateOfflineStream(
+        recognizer: *const SherpaOnnxOfflineRecognizer,
+    ) -> *const SherpaOnnxOfflineStream;
+
+    pub fn SherpaOnnxDestroyOfflineStream(stream: *const SherpaOnnxOfflineStream);
+
+    /// 每条流只能调一次。
+    pub fn SherpaOnnxAcceptWaveformOffline(
+        stream: *const SherpaOnnxOfflineStream,
+        sample_rate: c_int,
+        samples: *const c_float,
+        n: c_int,
+    );
+
+    pub fn SherpaOnnxDecodeOfflineStream(
+        recognizer: *const SherpaOnnxOfflineRecognizer,
+        stream: *const SherpaOnnxOfflineStream,
+    );
+
+    pub fn SherpaOnnxGetOfflineStreamResult(
+        stream: *const SherpaOnnxOfflineStream,
+    ) -> *const SherpaOnnxOfflineRecognizerResult;
+
+    pub fn SherpaOnnxDestroyOfflineRecognizerResult(
+        r: *const SherpaOnnxOfflineRecognizerResult,
+    );
 }
 
 pub struct OnlineRecognizer {
@@ -584,6 +768,217 @@ impl Drop for VoiceActivityDetector {
     fn drop(&mut self) {
         unsafe {
             SherpaOnnxDestroyVoiceActivityDetector(self.vad);
+        }
+    }
+}
+
+// ============================================================================
+// OfflineRecognizer —— sherpa-onnx 1.12.9 的非流式 ASR 包装
+// ============================================================================
+//
+// 与 OnlineRecognizer 的差异：
+// - **没有 while-ready 循环**：accept 一次 → decode 一次 → get_result
+// - **AcceptWaveformOffline 每条流只能调一次**（c-api.h:581 注释明示）
+// - 句柄按 C 头文件用 *const（与现有 OnlineRecognizer 用 *mut 风格不同）
+// - 用于精修（refine）：流式切段后，把整段音频另喂给 OfflineRecognizer，
+//   拿更高质量（更低 CER）的最终文本
+
+pub struct OfflineRecognizer {
+    recognizer: *const SherpaOnnxOfflineRecognizer,
+    _model_path: CString,
+    _tokens_path: CString,
+    _provider: CString,
+    _decoding: CString,
+}
+
+unsafe impl Send for OfflineRecognizer {}
+unsafe impl Sync for OfflineRecognizer {}
+
+pub struct OfflineStream {
+    stream: *const SherpaOnnxOfflineStream,
+}
+
+// OfflineStream 不需要 Send/Sync：每条流由单一线程持有、用完即 drop。
+unsafe impl Send for OfflineStream {}
+unsafe impl Sync for OfflineStream {}
+
+impl OfflineRecognizer {
+    /// 创建非流式 recognizer。当前实现只支持 Zipformer CTC（plan §1.1）。
+    /// 模型路径是 `model.int8.onnx` 单文件；tokens.txt 是分词表。
+    pub fn new(
+        model_path: &str,
+        tokens_path: &str,
+        num_threads: i32,
+        provider: &str,
+        decoding_method: &str,
+    ) -> anyhow::Result<Self> {
+        unsafe {
+            let model_c = CString::new(model_path)
+                .map_err(|e| anyhow::anyhow!("model_path 含 NUL: {}", e))?;
+            let tokens_c = CString::new(tokens_path)
+                .map_err(|e| anyhow::anyhow!("tokens_path 含 NUL: {}", e))?;
+            let provider_c = CString::new(provider)
+                .map_err(|e| anyhow::anyhow!("provider 含 NUL: {}", e))?;
+            let decoding_c = CString::new(decoding_method)
+                .map_err(|e| anyhow::anyhow!("decoding_method 含 NUL: {}", e))?;
+
+            let config = SherpaOnnxOfflineRecognizerConfig {
+                feat_config: SherpaOnnxFeatureConfig {
+                    sample_rate: 16000,
+                    feature_dim: 80,
+                },
+                model_config: SherpaOnnxOfflineModelConfig {
+                    // 占位全部置零 / null：本项目只用 zipformer_ctc
+                    transducer: SherpaOnnxOfflineTransducerModelConfig {
+                        encoder: ptr::null(),
+                        decoder: ptr::null(),
+                        joiner: ptr::null(),
+                    },
+                    paraformer: SherpaOnnxOfflineParaformerModelConfig { model: ptr::null() },
+                    nemo_ctc: SherpaOnnxOfflineNemoEncDecCtcModelConfig { model: ptr::null() },
+                    whisper: SherpaOnnxOfflineWhisperModelConfig {
+                        encoder: ptr::null(),
+                        decoder: ptr::null(),
+                        language: ptr::null(),
+                        task: ptr::null(),
+                        tail_paddings: 0,
+                    },
+                    tdnn: SherpaOnnxOfflineTdnnModelConfig { model: ptr::null() },
+                    tokens: tokens_c.as_ptr(),
+                    num_threads,
+                    debug: 0,
+                    provider: provider_c.as_ptr(),
+                    model_type: ptr::null(),
+                    modeling_unit: ptr::null(),
+                    bpe_vocab: ptr::null(),
+                    telespeech_ctc: ptr::null(),
+                    sense_voice: SherpaOnnxOfflineSenseVoiceModelConfig {
+                        model: ptr::null(),
+                        language: ptr::null(),
+                        use_itn: 0,
+                    },
+                    moonshine: SherpaOnnxOfflineMoonshineModelConfig {
+                        preprocessor: ptr::null(),
+                        encoder: ptr::null(),
+                        uncached_decoder: ptr::null(),
+                        cached_decoder: ptr::null(),
+                    },
+                    fire_red_asr: SherpaOnnxOfflineFireRedAsrModelConfig {
+                        encoder: ptr::null(),
+                        decoder: ptr::null(),
+                    },
+                    dolphin: SherpaOnnxOfflineDolphinModelConfig { model: ptr::null() },
+                    // ★ 真正在用的槽位
+                    zipformer_ctc: SherpaOnnxOfflineZipformerCtcModelConfig {
+                        model: model_c.as_ptr(),
+                    },
+                    canary: SherpaOnnxOfflineCanaryModelConfig {
+                        encoder: ptr::null(),
+                        decoder: ptr::null(),
+                        src_lang: ptr::null(),
+                        tgt_lang: ptr::null(),
+                        use_pnc: 0,
+                    },
+                },
+                lm_config: SherpaOnnxOfflineLMConfig {
+                    model: ptr::null(),
+                    scale: 0.0,
+                },
+                decoding_method: decoding_c.as_ptr(),
+                max_active_paths: 4,
+                hotwords_file: ptr::null(),
+                hotwords_score: 0.0,
+                rule_fsts: ptr::null(),
+                rule_fars: ptr::null(),
+                blank_penalty: 0.0,
+                hr: SherpaOnnxHomophoneReplacerConfig {
+                    dict_dir: ptr::null(),
+                    lexicon: ptr::null(),
+                    rule_fsts: ptr::null(),
+                },
+            };
+
+            let recognizer = SherpaOnnxCreateOfflineRecognizer(&raw const config);
+            if recognizer.is_null() {
+                anyhow::bail!(
+                    "创建非流式 recognizer 失败（检查模型路径: {} 与 tokens.txt: {}）",
+                    model_path,
+                    tokens_path
+                );
+            }
+
+            Ok(Self {
+                recognizer,
+                _model_path: model_c,
+                _tokens_path: tokens_c,
+                _provider: provider_c,
+                _decoding: decoding_c,
+            })
+        }
+    }
+
+    pub fn create_stream(&self) -> OfflineStream {
+        unsafe {
+            let stream = SherpaOnnxCreateOfflineStream(self.recognizer);
+            OfflineStream { stream }
+        }
+    }
+}
+
+impl OfflineStream {
+    /// 每条流只能调一次。重复调用是 UB（c-api.h:581 注释）。
+    pub fn accept_waveform(&mut self, sample_rate: i32, samples: &[f32]) {
+        unsafe {
+            SherpaOnnxAcceptWaveformOffline(
+                self.stream,
+                sample_rate,
+                samples.as_ptr(),
+                samples.len() as c_int,
+            );
+        }
+    }
+
+    pub fn decode(&mut self, recognizer: &OfflineRecognizer) {
+        unsafe {
+            SherpaOnnxDecodeOfflineStream(recognizer.recognizer, self.stream);
+        }
+    }
+
+    /// 取最终文本。必须在 decode() 之后调用。
+    /// 关键：把 text 拷成 owned String 再 DestroyOfflineRecognizerResult，
+    /// 否则 LTO 下会读到 free 后的内存（参照 OnlineRecognizer::get_result）。
+    pub fn get_result(&self) -> String {
+        unsafe {
+            let result = SherpaOnnxGetOfflineStreamResult(self.stream);
+            if result.is_null() {
+                return String::new();
+            }
+            let text = {
+                let text_ptr = (*result).text;
+                if text_ptr.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(text_ptr).to_string_lossy().into_owned()
+                }
+            };
+            SherpaOnnxDestroyOfflineRecognizerResult(result);
+            text
+        }
+    }
+}
+
+impl Drop for OfflineRecognizer {
+    fn drop(&mut self) {
+        unsafe {
+            SherpaOnnxDestroyOfflineRecognizer(self.recognizer);
+        }
+    }
+}
+
+impl Drop for OfflineStream {
+    fn drop(&mut self) {
+        unsafe {
+            SherpaOnnxDestroyOfflineStream(self.stream);
         }
     }
 }

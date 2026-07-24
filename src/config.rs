@@ -25,6 +25,20 @@ pub struct Config {
     #[serde(default = "default_vad_provider")]
     pub vad_provider: String,
 
+    // ----- 离线 ASR refine 字段 -----
+    #[serde(default = "default_offline_model_path")]
+    pub offline_model_path: String,
+    #[serde(default = "default_offline_tokens_path")]
+    pub offline_tokens_path: String,
+    #[serde(default = "default_offline_num_threads")]
+    pub offline_num_threads: i32,
+    #[serde(default = "default_offline_provider")]
+    pub offline_provider: String,
+    #[serde(default = "default_offline_decoding")]
+    pub offline_decoding: String,
+    #[serde(default = "default_enable_offline_refine")]
+    pub enable_offline_refine: bool,
+
     // ----- GUI 字段 -----
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
@@ -67,6 +81,33 @@ fn default_vad_provider() -> String {
     "cpu".to_string()
 }
 
+// 离线 ASR 默认值：Zipformer CTC 中文 int8 模型
+// （sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03，由 ./setup_models.sh 下载）
+fn default_offline_model_path() -> String {
+    "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx".to_string()
+}
+
+fn default_offline_tokens_path() -> String {
+    "./models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt".to_string()
+}
+
+fn default_offline_num_threads() -> i32 {
+    2
+}
+
+fn default_offline_provider() -> String {
+    "cpu".to_string()
+}
+
+/// Zipformer CTC 模型 beam search 增益极小，greedy 既快又准。
+fn default_offline_decoding() -> String {
+    "greedy_search".to_string()
+}
+
+fn default_enable_offline_refine() -> bool {
+    true
+}
+
 fn default_hotkey() -> String {
     "F3".to_string()
 }
@@ -83,6 +124,12 @@ impl Default for Config {
             vad_max_speech_duration: default_vad_max_speech_duration(),
             vad_num_threads: default_vad_num_threads(),
             vad_provider: default_vad_provider(),
+            offline_model_path: default_offline_model_path(),
+            offline_tokens_path: default_offline_tokens_path(),
+            offline_num_threads: default_offline_num_threads(),
+            offline_provider: default_offline_provider(),
+            offline_decoding: default_offline_decoding(),
+            enable_offline_refine: default_enable_offline_refine(),
             hotkey: default_hotkey(),
         }
     }
@@ -107,9 +154,8 @@ mod tests {
     fn test_config_default() {
         let config = Config::default();
         assert_eq!(config.model_dir, "./models");
-        // 注意：vad_threshold 现在是 ten-vad 概率阈值，默认 0.5；
-        // 不再是早期能量 VAD 时代的 0.01。
         assert_eq!(config.vad_threshold, 0.5);
+        assert_eq!(config.enable_offline_refine, true);
         assert_eq!(config.hotkey, "F3");
     }
 
@@ -135,6 +181,17 @@ mod tests {
     }
 
     #[test]
+    fn test_config_offline_fields_default() {
+        let c = Config::default();
+        assert!(c.offline_model_path.ends_with("model.int8.onnx"));
+        assert!(c.offline_tokens_path.ends_with("tokens.txt"));
+        assert_eq!(c.offline_num_threads, 2);
+        assert_eq!(c.offline_provider, "cpu");
+        assert_eq!(c.offline_decoding, "greedy_search");
+        assert!(c.enable_offline_refine);
+    }
+
+    #[test]
     fn test_config_load_valid() {
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         writeln!(temp_file, "model_dir = \"/custom/models\"").unwrap();
@@ -145,17 +202,19 @@ mod tests {
         writeln!(temp_file, "vad_window_size = 512").unwrap();
         writeln!(temp_file, "vad_num_threads = 4").unwrap();
         writeln!(temp_file, "vad_provider = \"cuda\"").unwrap();
+        writeln!(temp_file, "offline_model_path = \"/custom/offline.onnx\"").unwrap();
+        writeln!(temp_file, "offline_tokens_path = \"/custom/tokens.txt\"").unwrap();
+        writeln!(temp_file, "offline_num_threads = 1").unwrap();
+        writeln!(temp_file, "enable_offline_refine = false").unwrap();
         writeln!(temp_file, "hotkey = \"F4\"").unwrap();
 
         let config = Config::load(temp_file.path()).unwrap();
         assert_eq!(config.model_dir, "/custom/models");
-        assert_eq!(config.vad_model_path, "/custom/ten-vad.onnx");
         assert_eq!(config.vad_threshold, 0.7);
-        assert_eq!(config.vad_min_silence_ms, 800);
-        assert_eq!(config.vad_min_speech_ms, 250);
-        assert_eq!(config.vad_window_size, 512);
-        assert_eq!(config.vad_num_threads, 4);
-        assert_eq!(config.vad_provider, "cuda");
+        assert_eq!(config.offline_model_path, "/custom/offline.onnx");
+        assert_eq!(config.offline_tokens_path, "/custom/tokens.txt");
+        assert_eq!(config.offline_num_threads, 1);
+        assert_eq!(config.enable_offline_refine, false);
         assert_eq!(config.hotkey, "F4");
     }
 }

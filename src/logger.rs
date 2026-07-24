@@ -104,6 +104,17 @@ impl SessionLog {
         });
     }
 
+    /// 离线 ASR refine 覆盖事件 —— 流式 final 出炉后再被非流式精修时记录。
+    /// `streaming_text` 是屏幕上先打印的版本，`refined_text` 是非流式覆盖后的版本。
+    /// 两者一致时也记（用于复盘"精修没改字"的比例）。
+    pub fn refine(&mut self, streaming_text: &str, refined_text: &str) {
+        self.emit(&LogEvent::Refine {
+            ts_ms: now_ms(),
+            streaming_text: streaming_text.to_string(),
+            refined_text: refined_text.to_string(),
+        });
+    }
+
     /// 任意错误事件，不致命但值得记录。
     #[allow(dead_code)]
     pub fn warn(&mut self, message: &str) {
@@ -175,6 +186,11 @@ enum LogEvent {
     Final {
         ts_ms: u64,
         text: String,
+    },
+    Refine {
+        ts_ms: u64,
+        streaming_text: String,
+        refined_text: String,
     },
     #[allow(dead_code)]
     Warn {

@@ -356,6 +356,56 @@ cinnabar --vad-model /path/to/your/ten-vad.onnx
 
 注意：ten-vad 的 threshold 是**概率**（0.0-1.0），不是早期能量 VAD 时代的能量值 0.01，**两者不可类比**。
 
+### 问题：非流式 ASR 加载失败
+
+启动时打印 `⚠️  非流式 ASR 加载失败，退回纯流式`，识别仍能跑但屏幕上的 final 不会被精修覆盖。
+
+**检查**：
+1. `models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx` 是否存在
+2. `models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt` 是否存在
+3. `config.toml` 的 `offline_model_path` / `offline_tokens_path` 是否与实际路径匹配
+4. `provider`（默认 `cpu`）是否与硬件兼容
+
+**手动拉取**：
+```bash
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03.tar.bz2 \
+     -O /tmp/offline.tar.bz2
+mkdir -p models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03
+tar -xjf /tmp/offline.tar.bz2 -C /tmp/
+cp /tmp/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/*.onnx \
+   /tmp/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt \
+   models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/
+```
+
+### 问题：refine 之后屏幕上的 final 没被覆盖
+
+非流式返回的文本与流式**完全一致**时，代码不会触发 `print_final_replace`（避免无意义光标跳动）。日志里能看到 `refine` 事件的 `streaming_text == refined_text`，证明非流式确实跑了，只是没改字。
+
+如果希望**每次都强制覆盖**（比如测试阶段），可以临时把 `print_final_replace` 的 `if refined != trimmed_final` 条件改成总是触发。
+
+### 问题：refine 太慢（CPU 老 / 笔记本）
+
+非流式 RTF 在官方文档里是 0.062（具体硬件未标注，按官方基准配置），老 CPU 实测可能 500ms–1s。
+
+**缓解**：
+- `config.toml` 里把 `offline_num_threads` 减到 1（单线程对小 segment 够用）
+- 改用更轻量的模型：`offline_model_path = "./models/sherpa-onnx-paraformer-zh-small-2024-03-09/model.int8.onnx"`（78MB，RTF 0.076，但官方没有 WER 数据）
+- 直接关掉：`enable_offline_refine = false` 或 `--no-offline-refine`，退回纯流式
+
+### 问题：流式 vs 精修 文本不一致
+
+正常情况下这正是 refine 的意义 —— 流式贪婪解码先出"差不多"的版本，离线重算修正几个字。
+
+JSONL 里看具体差异：
+```bash
+jq -c 'select(.event=="refine")' ~/.local/share/cinnabar/sessions/*.jsonl
+```
+
+常见原因：
+- 中英混输：流式把 `divide` 拼成 `d i v i d`，离线拼成 `divide` 或 `divide`
+- 数字识别：流式把"二零二三"按字拆，离线可能合并成"2023"
+- 同音字：流式选了"在/再"错的版本
+
 ---
 
 ## 性能问题

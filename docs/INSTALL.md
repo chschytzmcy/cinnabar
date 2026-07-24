@@ -184,16 +184,24 @@ git clone git@github.com:yourusername/cinnabar.git
 **4. 下载模型文件**
 
 ```bash
-# 运行模型下载脚本（同时下载 ASR + ten-vad）
+# 运行模型下载脚本（同时下载 ASR 流式 + ASR 非流式 + ten-vad）
 ./setup_models.sh
 
 # 验证模型文件
 ls -lh models/
+ls -lh models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/
 # 应该看到：
-# - encoder.int8.onnx (~20MB)        ← ASR
-# - decoder.int8.onnx (~20MB)        ← ASR
-# - tokens.txt     (~500KB)          ← ASR
-# - ten-vad.onnx  (~324KB)           ← VAD（v1.2.4+）
+# - encoder.int8.onnx (~20MB)                                                ← ASR 流式
+# - decoder.int8.onnx (~20MB)                                                ← ASR 流式
+# - tokens.txt     (~500KB)                                                  ← ASR 流式
+# - ten-vad.onnx  (~324KB)                                                   ← VAD（v1.2.4+）
+# - sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx (~350MB)   ← ASR 非流式（v1.2.5+）
+# - sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt (~5MB)          ← ASR 非流式
+
+# 如果只想用流式（省内存 / 老 CPU），可以在 config.toml 里关掉：
+# enable_offline_refine = false
+# 或 CLI：
+cinnabar --no-offline-refine
 ```
 
 如果 ten-vad 模型缺失，会在启动时报错 `创建 ten-vad VoiceActivityDetector 失败`；可手动下载：
@@ -201,6 +209,18 @@ ls -lh models/
 ```bash
 wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/ten-vad.onnx \
      -O models/ten-vad.onnx
+```
+
+如果非流式模型缺失，会在启动时打印 `⚠️  非流式 ASR 加载失败，退回纯流式`（不是 fatal 错误）；可手动下载：
+
+```bash
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03.tar.bz2 \
+     -O /tmp/offline.tar.bz2
+mkdir -p models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03
+tar -xjf /tmp/offline.tar.bz2 -C /tmp/
+cp /tmp/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/*.onnx \
+   /tmp/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt \
+   models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/
 ```
 
 **5. 编译项目**
