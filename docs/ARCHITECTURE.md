@@ -4,22 +4,66 @@
 面向想理解"为什么 partial 和 final 文本一致"、"为什么 VAD 切段后要等 200ms"、
 "非流式 ASR 何时被调用"等问题的开发者。
 
----
+> **v2.0.0 更新**：非流式 ASR 从 `Zipformer CTC` 换为 `Paraformer`，流式 ASR 从
+> `streaming-paraformer` 换为 `x-asr Zipformer transducer`。模块拆分：`display.rs` /
+> `refine_score.rs` / `itn.rs` 从 `main.rs` 抽出。
 
 ## 1. 三大组件的角色
 
-| 组件 | 角色 | 运行时机 | 输出 |
-|---|---|---|---|
-| **流式 ASR**（Paraformer streaming-zh-en） | 实时反馈，跟手显示 | **常驻**，每 ~41ms 音频帧跑一次 | partial（增量文本）+ final（切段时刻的快照） |
-| **VAD**（ten-vad） | 句子边界检测 | **常驻**，每帧跑一次 | speech 段（含起止 1.2s 静音尾） |
-| **非流式 ASR**（Zipformer CTC 中文 int8） | 准确定稿 | **按需**，每个 VAD 段一次 | 精修文本 |
+| 组件 | 模型 | 角色 | 运行时机 | 输出 |
+|---|---|---|---|---|
+| **流式 ASR** | x-asr Zipformer transducer（中英双语 + 内置标点） | 实时反馈，跟手显示 | **常驻**，每 ~41ms 音频帧跑一次 | partial（增量文本）+ final（切段时刻的快照） |
+| **VAD** | ten-vad | 句子边界检测 | **常驻**，每帧跑一次 | speech 段（含起止 1.2s 静音尾） |
+| **非流式 ASR** | Paraformer zh-2023-09-14（attention decoder） | 准确定稿 | **按需**，每个 VAD 段一次 | 精修文本 |
 
 三者**完全独立运行**，只在 VAD 切段那一刻发生交汇。
 
 类比：
-- **流式 ASR** ≈ "自言自语复述"——边听边小声复述（"今...今天...今天天气"）
+- **流式 ASR** ≈ "自言自语复述"——边听边小声复述（"今 天 天 气"）
 - **VAD** ≈ "句子边界判断"——听到静音期就提醒"该整理了"
 - **非流式 ASR** ≈ "听完后整理"——完整听完一段后给出最终版（"今天天气好啊"）
+
+---
+
+## 1.1 模块结构
+
+```
+src/
+├── main.rs              主循环 + main() 入口                (~800 行)
+├── itn.rs               中文数字归一化（仅 print 阶段）   (~240 行)
+├── display.rs           TTY/pipe 输出 + 文本归一化         (~75 行)
+├── refine_score.rs      三因子相似度评分 + 三档决策       (~300 行)
+├── config.rs            TOML 配置 + 默认值                (~253 行)
+├── logger.rs            JSONL 会话日志                   (~316 行)
+├── vad.rs               ten-vad 包装                     (~108 行)
+├── ffi.rs               sherpa-onnx-c-api Rust 绑定      (~900 行)
+├── recognizer.rs        GUI 模式识别引擎               (~220 行)
+├── resampler.rs         简单线性重采样                (~60 行)
+├── injector.rs          剪贴板 + uinput 文本注入       (~170 行)
+└── gui/                 egui 桌面 UI                    (~200 行)
+```
+
+### 模块依赖
+
+```
+                    ┌────────┐
+                    │ main   │
+                    └───┬────┘
+          ┌───────────┬──┴──┬────────────┐
+          ▼           ▼     ▼            ▼
+     ┌────────┐  ┌──────┐  ┌─────┐  ┌────────┐
+     │ display│  │logger│  │ vad │  │  ffi   │
+     └────┬───┘  └──────┘  └─────┘  └────────┘
+          │
+          ▼
+     ┌─────────┐
+     │  itn   │
+     └─────────┘
+```
+
+`refine_score` 由 main 调用（不依赖其他模块）。
+`config` 由 main 读取（被所有模块通过 `Config::load` 间接依赖）。
+`gui` 与 CLI 模式互斥（用 `if let Some(ref mut r) = gui { ... }` 分支）。
 
 ---
 
