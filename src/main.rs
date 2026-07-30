@@ -10,12 +10,13 @@ mod refine_score;
 mod resampler;
 mod vad;
 mod wayland;
+mod wav_source;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::Config;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, RecvTimeoutError};
 use ffi::{OfflineRecognizer, OnlineRecognizer};
 use logger::{SegmentCommitInfo, SessionEndReason, SessionLog, SessionStartInfo};
 use resampler::LinearResampler;
@@ -23,6 +24,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use vad::{VadConfig, drain_segments};
 
 #[derive(Parser, Debug)]
@@ -47,6 +49,12 @@ pub struct Args {
 
     #[arg(long)]
     device_name: Option<String>,
+
+    /// 从本地 wav 文件输入而非麦克风。
+    /// 要求 PCM s16le / 16 kHz / 单声道（10 秒 = 160 000 样本）。
+    /// 文件读完即走 vad.flush() + drain + 正常退出（session_end 标 CleanExit）。
+    #[arg(long, value_name = "PATH")]
+    input_file: Option<PathBuf>,
 
     #[arg(short, long)]
     verbose: bool,
@@ -164,6 +172,10 @@ fn main() -> Result<()> {
     // CLI 模式
     let host = cpal::default_host();
 
+    if args.list_devices && args.input_file.is_some() {
+        anyhow::bail!("--list-devices 与 --input-file 互斥");
+    }
+
     if args.list_devices {
         println!("可用的音频输入设备：\n");
         for (idx, device) in host.input_devices()?.enumerate() {
@@ -215,67 +227,7 @@ let recognizer = OnlineRecognizer::new(
 
     let mut stream = recognizer.create_stream();
 
-    let device = if let Some(idx) = args.device {
-        host.input_devices()?
-            .nth(idx)
-            .context(format!("设备索引 {} 无效", idx))?
-    } else if let Some(name) = &args.device_name {
-        host.input_devices()?
-            .find(|d| d.name().ok().as_ref() == Some(name))
-            .context(format!("未找到设备名称: {}", name))?
-    } else {
-        host.default_input_device().context("未找到默认输入设备")?
-    };
-
-    println!(
-        "🎤 使用设备: {}",
-        device.name().unwrap_or_else(|_| "未知设备".to_string())
-    );
-
-    // 尝试配置 16000Hz 单声道，如果不支持则使用默认配置并启用重采样
-    let target_sample_rate = 16000;
-
-    // 检查设备是否支持 16kHz 单声道配置
-    let supports_16khz = device
-        .supported_input_configs()
-        .ok()
-        .and_then(|configs| {
-            configs.filter(|c| c.channels() == 1).find(|c| {
-                let min = c.min_sample_rate().0;
-                let max = c.max_sample_rate().0;
-                target_sample_rate >= min && target_sample_rate <= max
-            })
-        })
-        .is_some();
-
-    let (config, use_resampler) = if supports_16khz {
-        println!("🔧 使用配置: 16000 Hz, 1 声道");
-        (
-            cpal::StreamConfig {
-                channels: 1,
-                sample_rate: cpal::SampleRate(target_sample_rate),
-                buffer_size: cpal::BufferSize::Default,
-            },
-            false,
-        )
-    } else {
-        let default_config = device.default_input_config()?;
-        let sample_rate = default_config.sample_rate().0;
-        println!(
-            "⚠️  16kHz 不支持，使用默认配置: {} Hz, {} 声道（将启用重采样）",
-            sample_rate,
-            default_config.channels()
-        );
-        (
-            cpal::StreamConfig {
-                channels: default_config.channels(),
-                sample_rate: default_config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            },
-            sample_rate != target_sample_rate,
-        )
-    };
-
+    // 共享通道与 ctrlc：两条路径（mic / wav）都把样本喂到同一 tx。
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
 
@@ -284,53 +236,143 @@ let recognizer = OnlineRecognizer::new(
     })?;
 
     let (tx, rx) = bounded::<Vec<f32>>(100);
-    let actual_sample_rate = config.sample_rate.0;
-    let channels = config.channels;
     let _verbose = args.verbose;
 
-    let audio_stream = device.build_input_stream(
-        &config,
-        move |data: &[f32], _| {
-            let mono_data: Vec<f32> = if channels > 1 {
-                data.chunks(channels as usize)
-                    .map(|chunk| {
-                        let sum: f32 = chunk.iter().sum();
-                        // 使用 sqrt(channels) 作为除数，避免音量过小
-                        sum / (channels as f32).sqrt()
-                    })
-                    .collect()
-            } else {
-                data.to_vec()
-            };
-            let _ = tx.try_send(mono_data);
-        },
-        |err| eprintln!("错误：{}", err),
-        None,
-    )?;
+    // ── 音频源分支：本地 wav 文件 vs 麦克风 ──
+    // 两条路径都把 f32 mono 16 kHz 样本送到同一个 tx；下游主循环不感知来源。
+    let target_sample_rate: u32 = 16000;
+    let actual_sample_rate: u32;
+    let mut resampler: Option<LinearResampler> = None;
+    let mut session_end_reason = SessionEndReason::CtrlC;
+    let mut wav_handle: Option<JoinHandle<Result<u64>>> = None;
+    let session_device: String;
+    let mut session_channels: u16 = 1;
+    let mut session_resampled = false;
+    // cpal::Stream 必须在 main 全程保持存活；Drop 时回调会自动停止。
+    let mut _audio_stream_keepalive: Option<cpal::Stream> = None;
 
-    audio_stream.play()?;
+    if let Some(path) = args.input_file.clone() {
+        // ── 文件输入 ──
+        if !path.exists() {
+            anyhow::bail!("--input-file 指定的文件不存在: {}", path.display());
+        }
+        println!("📁 输入文件: {}", path.display());
+        session_device = format!("file://{}", path.display());
+        actual_sample_rate = target_sample_rate;
+        wav_handle = Some(wav_source::spawn(
+            &path,
+            tx,
+            wav_source::DEFAULT_CHUNK_SAMPLES,
+        ));
+        session_end_reason = SessionEndReason::CleanExit;
+    } else {
+        // ── 麦克风输入（原有 cpal 路径） ──
+        let host = cpal::default_host();
 
-    println!("开始监听... 按 Ctrl+C 停止");
+        let device = if let Some(idx) = args.device {
+            host.input_devices()?
+                .nth(idx)
+                .context(format!("设备索引 {} 无效", idx))?
+        } else if let Some(name) = &args.device_name {
+            host.input_devices()?
+                .find(|d| d.name().ok().as_ref() == Some(name))
+                .context(format!("未找到设备名称: {}", name))?
+        } else {
+            host.default_input_device().context("未找到默认输入设备")?
+        };
 
-    let device_name = device.name().unwrap_or_else(|_| "未知设备".to_string());
+        let device_name = device.name().unwrap_or_else(|_| "未知设备".to_string());
+        println!("🎤 使用设备: {}", device_name);
+        session_device = device_name;
+
+        // 检查设备是否支持 16kHz 单声道配置
+        let supports_16khz = device
+            .supported_input_configs()
+            .ok()
+            .and_then(|configs| {
+                configs.filter(|c| c.channels() == 1).find(|c| {
+                    let min = c.min_sample_rate().0;
+                    let max = c.max_sample_rate().0;
+                    target_sample_rate >= min && target_sample_rate <= max
+                })
+            })
+            .is_some();
+
+        let (config, use_resampler) = if supports_16khz {
+            println!("🔧 使用配置: 16000 Hz, 1 声道");
+            (
+                cpal::StreamConfig {
+                    channels: 1,
+                    sample_rate: cpal::SampleRate(target_sample_rate),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                false,
+            )
+        } else {
+            let default_config = device.default_input_config()?;
+            let sample_rate = default_config.sample_rate().0;
+            println!(
+                "⚠️  16kHz 不支持，使用默认配置: {} Hz, {} 声道（将启用重采样）",
+                sample_rate,
+                default_config.channels()
+            );
+            (
+                cpal::StreamConfig {
+                    channels: default_config.channels(),
+                    sample_rate: default_config.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                sample_rate != target_sample_rate,
+            )
+        };
+
+        actual_sample_rate = config.sample_rate.0;
+        session_channels = config.channels;
+        session_resampled = use_resampler;
+        resampler = if use_resampler {
+            Some(LinearResampler::new(actual_sample_rate, target_sample_rate))
+        } else {
+            None
+        };
+
+        let channels = config.channels;
+        let audio_stream = device.build_input_stream(
+            &config,
+            move |data: &[f32], _| {
+                let mono_data: Vec<f32> = if channels > 1 {
+                    data.chunks(channels as usize)
+                        .map(|chunk| {
+                            let sum: f32 = chunk.iter().sum();
+                            // 使用 sqrt(channels) 作为除数，避免音量过小
+                            sum / (channels as f32).sqrt()
+                        })
+                        .collect()
+                } else {
+                    data.to_vec()
+                };
+                let _ = tx.try_send(mono_data);
+            },
+            |err| eprintln!("错误：{}", err),
+            None,
+        )?;
+
+        audio_stream.play()?;
+        println!("开始监听... 按 Ctrl+C 停止");
+        _audio_stream_keepalive = Some(audio_stream);
+    }
+
     session_log.session_start(&SessionStartInfo {
         mode: "cli".to_string(),
         model_dir: args.model_dir.display().to_string(),
-        device: device_name.clone(),
+        device: session_device.clone(),
         sample_rate: actual_sample_rate,
-        channels: config.channels,
-        resampled: use_resampler,
+        channels: session_channels,
+        resampled: session_resampled,
         vad_model_path: vad_cfg.model_path.clone(),
         vad_threshold: vad_cfg.threshold,
         min_silence_ms: vad_cfg.min_silence_ms,
         min_speech_ms: vad_cfg.min_speech_ms,
     });
-
-    let mut resampler = if use_resampler {
-        Some(LinearResampler::new(actual_sample_rate, target_sample_rate))
-    } else {
-        None
-    };
 
     // ten-vad：神经网络 VAD，由 sherpa-onnx C-API 直接驱动。
     // 失败一般意味着模型路径错、ONNX 损坏、或 window_size 与 sample_rate 不匹配。
@@ -401,171 +443,203 @@ let recognizer = OnlineRecognizer::new(
     let debounce = std::time::Duration::from_millis(args.debounce_ms);
 
     while running.load(Ordering::Relaxed) {
-        if let Ok(samples) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            if samples.is_empty() {
-                continue;
-            }
-
-            let samples_16k = if let Some(ref mut r) = resampler {
-                r.resample(&samples)
-            } else {
-                samples
-            };
-
-            // 检查重采样后的数据是否为空
-            if samples_16k.is_empty() {
-                continue;
-            }
-
-            stream.accept_waveform(target_sample_rate as i32, &samples_16k);
-            samples_in_session = samples_in_session.saturating_add(samples_16k.len() as u64);
-
-            // VAD 也吃同样的 16 kHz 样本，与 ASR 并行推进；VAD 自身决定何时切段。
-            // 先于 partial 打印之前调用，避免 partial 还没刷出来就被 final 覆盖掉。
-            vad.accept_waveform(&samples_16k);
-
-            // ten-vad 的 flush() 强制吐出 pending segment。
-            // 长静音时（用户停顿 > min_silence_ms），ten-vad 内部状态机不会自然 emit
-            // 段，必须手动 flush 触发。否则用户停顿时 VAD 不会自动 commit final，
-            // 必须 Ctrl+C 才能 commit（退回到 last_printed 兜底逻辑，丢失准确率）。
-            // 调用条件：当前帧是静音（即 is_speech_detected == false），避免频繁调。
-            if !vad.is_speech_detected() {
-                vad.flush();
-            }
-
-            while recognizer.is_ready(&stream) {
-                recognizer.decode(&mut stream);
-            }
-            let result = recognizer.get_result(&stream);
-            let trimmed = result.trim();
-
-            if !trimmed.is_empty() && trimmed != last_result {
-                last_result = trimmed.to_string();
-                partial_seq = partial_seq.saturating_add(1);
-                // 文本变更即落日志（printed=false），便于事后回放 ASR 模型的贪心解码轨迹；
-                // 真正打印到屏幕时再补一条 printed=true，便于区分"模型识别的轨迹"和
-                // "用户看到的轨迹"。
-                session_log.partial(partial_seq, trimmed, samples_in_session, false);
-            }
-
-            // 节流 partial 打印：距上次打印至少 debounce_ms，且内容有变化。
-            // 与原来的 "500ms 无变化" 不同，这里只看打印节奏，不等 ASR 文本稳定，
-            // 所以跟手感大幅提升。TTY 下走就地覆盖（\r + ANSI clear-line），
-            // piped 下走普通 println，避免污染下游管道消费者。
-            if !last_result.is_empty()
-                && last_result != last_printed
-                && last_print_time.elapsed() >= debounce
-            {
-                display::print_partial(&last_result, stdout_is_tty);
-                last_printed = last_result.clone();
-                last_print_time = std::time::Instant::now();
-                // 补一条"用户可见"的日志，printed=true。
-                session_log.partial(partial_seq, &last_printed, samples_in_session, true);
-            }
-
-            let segments = drain_segments(&vad);
-            if !segments.is_empty() {
-                if args.verbose {
-                    eprintln!(
-                        "[DEBUG] ten-vad 切出 {} 个 segment（id={}, samples={}, duration={}ms）",
-                        segments.len(),
-                        segment_id,
-                        segments.iter().map(|s| s.samples.len()).sum::<usize>(),
-                        segments
-                            .iter()
-                            .map(|s| (s.samples.len() as u64 * 1000)
-                                / (vad_cfg.sample_rate as u64).max(1))
-                            .sum::<u64>()
-                    );
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(samples) => {
+                if samples.is_empty() {
+                    continue;
                 }
-                for seg in &segments {
-                    let final_result = recognizer.get_result(&stream);
-                    let trimmed_final = final_result.trim();
-                    let duration_ms = (seg.samples.len() as u64 * 1000)
-                        / (vad_cfg.sample_rate as u64).max(1);
-                    session_log.endpoint_detected(&SegmentCommitInfo {
-                        segment_id,
-                        start_sample: seg.start,
-                        samples: seg.samples.len() as u32,
-                        duration_ms,
-                    });
-                    if !trimmed_final.is_empty() {
-                        // TTY 下覆盖前一行 partial（如果还在），并以 \n 结束本行，
-                        // 让下一句 partial 从新行开始。piped 下保留 \n✅ 前缀风格。
-                        display::print_final(trimmed_final, stdout_is_tty);
-                        last_printed = trimmed_final.to_string();
-                        last_committed_final = trimmed_final.to_string();
-                        session_log.final_result(trimmed_final);
 
-                        // 非流式 ASR 精修：~200ms 内出结果，按 Jaccard 阈值决策。
-                        // - 高一致：直接覆盖屏幕
-                        // - 中等一致：覆盖但打 warn（精修可疑）
-                        // - 低一致：**不覆盖**，保留流式结果（精修可能错）
-                        // 紧跟 print_final 立即调用，期间不能有其它 stdout 输出，
-                        // 否则 \x1b[1A 会覆盖错行。
-                        if let Some(ref off) = offline {
-                            match refine_segment(off, &seg.samples, target_sample_rate as i32) {
-                                Ok(refined) if !refined.is_empty() => {
-                                    let score = refine_score::combined_score(trimmed_final, &refined);
-                                    let decision = refine_score::refine_decision(score);
-                                    match decision {
-                                        "override" => {
-                                            if refined != trimmed_final {
-                                                display::print_final_replace(&refined, stdout_is_tty);
-                                                last_printed = refined.clone();
-                                                last_committed_final = refined.clone();
+                let samples_16k = if let Some(ref mut r) = resampler {
+                    r.resample(&samples)
+                } else {
+                    samples
+                };
+
+                // 检查重采样后的数据是否为空
+                if samples_16k.is_empty() {
+                    continue;
+                }
+
+                stream.accept_waveform(target_sample_rate as i32, &samples_16k);
+                samples_in_session = samples_in_session.saturating_add(samples_16k.len() as u64);
+
+                // VAD 也吃同样的 16 kHz 样本，与 ASR 并行推进；VAD 自身决定何时切段。
+                // 先于 partial 打印之前调用，避免 partial 还没刷出来就被 final 覆盖掉。
+                vad.accept_waveform(&samples_16k);
+
+                // ten-vad 的 flush() 强制吐出 pending segment。
+                // 长静音时（用户停顿 > min_silence_ms），ten-vad 内部状态机不会自然 emit
+                // 段，必须手动 flush 触发。否则用户停顿时 VAD 不会自动 commit final，
+                // 必须 Ctrl+C 才能 commit（退回到 last_printed 兜底逻辑，丢失准确率）。
+                // 调用条件：当前帧是静音（即 is_speech_detected == false），避免频繁调。
+                if !vad.is_speech_detected() {
+                    vad.flush();
+                }
+
+                while recognizer.is_ready(&stream) {
+                    recognizer.decode(&mut stream);
+                }
+                let result = recognizer.get_result(&stream);
+                let trimmed = result.trim();
+
+                if !trimmed.is_empty() && trimmed != last_result {
+                    last_result = trimmed.to_string();
+                    partial_seq = partial_seq.saturating_add(1);
+                    // 文本变更即落日志（printed=false），便于事后回放 ASR 模型的贪心解码轨迹；
+                    // 真正打印到屏幕时再补一条 printed=true，便于区分"模型识别的轨迹"和
+                    // "用户看到的轨迹"。
+                    session_log.partial(partial_seq, trimmed, samples_in_session, false);
+                }
+
+                // 节流 partial 打印：距上次打印至少 debounce_ms，且内容有变化。
+                // 与原来的 "500ms 无变化" 不同，这里只看打印节奏，不等 ASR 文本稳定，
+                // 所以跟手感大幅提升。TTY 下走就地覆盖（\r + ANSI clear-line），
+                // piped 下走普通 println，避免污染下游管道消费者。
+                if !last_result.is_empty()
+                    && last_result != last_printed
+                    && last_print_time.elapsed() >= debounce
+                {
+                    display::print_partial(&last_result, stdout_is_tty);
+                    last_printed = last_result.clone();
+                    last_print_time = std::time::Instant::now();
+                    // 补一条"用户可见"的日志，printed=true。
+                    session_log.partial(partial_seq, &last_printed, samples_in_session, true);
+                }
+
+                let segments = drain_segments(&vad);
+                if !segments.is_empty() {
+                    if args.verbose {
+                        eprintln!(
+                            "[DEBUG] ten-vad 切出 {} 个 segment（id={}, samples={}, duration={}ms）",
+                            segments.len(),
+                            segment_id,
+                            segments.iter().map(|s| s.samples.len()).sum::<usize>(),
+                            segments
+                                .iter()
+                                .map(|s| (s.samples.len() as u64 * 1000)
+                                    / (vad_cfg.sample_rate as u64).max(1))
+                                .sum::<u64>()
+                        );
+                    }
+                    for seg in &segments {
+                        let final_result = recognizer.get_result(&stream);
+                        let trimmed_final = final_result.trim();
+                        let duration_ms = (seg.samples.len() as u64 * 1000)
+                            / (vad_cfg.sample_rate as u64).max(1);
+                        session_log.endpoint_detected(&SegmentCommitInfo {
+                            segment_id,
+                            start_sample: seg.start,
+                            samples: seg.samples.len() as u32,
+                            duration_ms,
+                        });
+                        if !trimmed_final.is_empty() {
+                            // TTY 下覆盖前一行 partial（如果还在），并以 \n 结束本行，
+                            // 让下一句 partial 从新行开始。piped 下保留 \n✅ 前缀风格。
+                            display::print_final(trimmed_final, stdout_is_tty);
+                            last_printed = trimmed_final.to_string();
+                            last_committed_final = trimmed_final.to_string();
+                            session_log.final_result(trimmed_final);
+
+                            // 非流式 ASR 精修：~200ms 内出结果，按 Jaccard 阈值决策。
+                            // - 高一致：直接覆盖屏幕
+                            // - 中等一致：覆盖但打 warn（精修可疑）
+                            // - 低一致：**不覆盖**，保留流式结果（精修可能错）
+                            // 紧跟 print_final 立即调用，期间不能有其它 stdout 输出，
+                            // 否则 \x1b[1A 会覆盖错行。
+                            if let Some(ref off) = offline {
+                                match refine_segment(off, &seg.samples, target_sample_rate as i32) {
+                                    Ok(refined) if !refined.is_empty() => {
+                                        let score = refine_score::combined_score(trimmed_final, &refined);
+                                        let decision = refine_score::refine_decision(score);
+                                        match decision {
+                                            "override" => {
+                                                if refined != trimmed_final {
+                                                    display::print_final_replace(&refined, stdout_is_tty);
+                                                    last_printed = refined.clone();
+                                                    last_committed_final = refined.clone();
+                                                }
                                             }
+                                            "override_warn" => {
+                                                if args.verbose {
+                                                    eprintln!(
+                                                        "[INFO] refine 综合分 {:.2} 偏低，覆盖屏幕但记 warn",
+                                                        score
+                                                    );
+                                                }
+                                                if refined != trimmed_final {
+                                                    display::print_final_replace(&refined, stdout_is_tty);
+                                                    last_printed = refined.clone();
+                                                    last_committed_final = refined.clone();
+                                                }
+                                            }
+                                            "rejected" => {
+                                                if args.verbose {
+                                                    eprintln!(
+                                                        "[INFO] refine 综合分 {:.2} 低于阈值，保留流式结果",
+                                                        score
+                                                    );
+                                                }
+                                                // 不覆盖屏幕，让用户看到流式版本
+                                            }
+                                            _ => unreachable!(),
                                         }
-                                        "override_warn" => {
-                                            if args.verbose {
-                                                eprintln!(
-                                                    "[INFO] refine 综合分 {:.2} 偏低，覆盖屏幕但记 warn",
-                                                    score
-                                                );
-                                            }
-                                            if refined != trimmed_final {
-                                                display::print_final_replace(&refined, stdout_is_tty);
-                                                last_printed = refined.clone();
-                                                last_committed_final = refined.clone();
-                                            }
-                                        }
-                                        "rejected" => {
-                                            if args.verbose {
-                                                eprintln!(
-                                                    "[INFO] refine 综合分 {:.2} 低于阈值，保留流式结果",
-                                                    score
-                                                );
-                                            }
-                                            // 不覆盖屏幕，让用户看到流式版本
-                                        }
-                                        _ => unreachable!(),
+                                        session_log.refine(trimmed_final, &refined, score, decision);
                                     }
-                                    session_log.refine(trimmed_final, &refined, score, decision);
-                                }
-                                Ok(_) => {
-                                    // refine 返回空字符串：罕见，记 warn 但不阻塞
-                                    if args.verbose {
-                                        eprintln!("[DEBUG] 非流式 refine 返回空文本，跳过覆盖");
+                                    Ok(_) => {
+                                        // refine 返回空字符串：罕见，记 warn 但不阻塞
+                                        if args.verbose {
+                                            eprintln!("[DEBUG] 非流式 refine 返回空文本，跳过覆盖");
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    if args.verbose {
-                                        eprintln!("[DEBUG] 非流式 refine 失败：{}", e);
+                                    Err(e) => {
+                                        if args.verbose {
+                                            eprintln!("[DEBUG] 非流式 refine 失败：{}", e);
+                                        }
                                     }
                                 }
                             }
                         }
+                        segment_id = segment_id.saturating_add(1);
                     }
-                    segment_id = segment_id.saturating_add(1);
+                    // 绕过 sherpa-onnx 1.12.9 OnlineStreamReset 路径下的状态损坏：
+                    // 直接销毁当前 OnlineStream，再用 recognizer 重新创建一个。
+                    // ten-vad 的 reset() 是独立的 C++ 对象调用，与 recognizer 流无关。
+                    stream = recognizer.create_stream();
+                    vad.reset();
+                    // 重建流后，partial 也必须重新开始计数，否则 debounce 会错乱。
+                    last_result.clear();
+                    last_print_time = std::time::Instant::now();
                 }
-                // 绕过 sherpa-onnx 1.12.9 OnlineStreamReset 路径下的状态损坏：
-                // 直接销毁当前 OnlineStream，再用 recognizer 重新创建一个。
-                // ten-vad 的 reset() 是独立的 C++ 对象调用，与 recognizer 流无关。
-                stream = recognizer.create_stream();
-                vad.reset();
-                // 重建流后，partial 也必须重新开始计数，否则 debounce 会错乱。
-                last_result.clear();
-                last_print_time = std::time::Instant::now();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // 音频源已退出（文件模式：feeder 读完；或消费端抢关）。
+                // 把 running 置 false 让主循环退出，走 flush + drain + session_end。
+                running.store(false, Ordering::Relaxed);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // 100ms 内没新数据：正常超时，继续轮询。
+                continue;
+            }
+        }
+    }
+
+    // 文件模式下先 join feeder，确认所有 chunk 都已入队 + 拿到读取错误（若有）。
+    // wav_handle 在主循环内已读完 + drop tx，主循环因此收到 Disconnected 退出。
+    // 但 join 仍能让我们拿到 feeder 的返回值（Ok(总样本数) / Err(读取失败)）。
+    if let Some(handle) = wav_handle.take() {
+        match handle.join() {
+            Ok(Ok(total)) => {
+                eprintln!(
+                    "[INFO] wav 已读完 {} 个样本（={}ms @ 16 kHz）",
+                    total,
+                    total * 1000 / 16_000
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!("[WARN] wav 读取失败: {:#}", e);
+            }
+            Err(_) => {
+                eprintln!("[WARN] wav feeder 线程 panic");
             }
         }
     }
@@ -643,7 +717,7 @@ let recognizer = OnlineRecognizer::new(
         );
     }
 
-    session_log.session_end(SessionEndReason::CtrlC);
+    session_log.session_end(session_end_reason);
     Ok(())
 }
 
@@ -666,8 +740,6 @@ fn refine_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // refine_score 的 13 个测试已迁到 src/refine_score.rs
     // 这里的测试只针对 main.rs 主循环集成
 }

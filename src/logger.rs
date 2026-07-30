@@ -171,7 +171,6 @@ pub struct SegmentCommitInfo {
 #[serde(rename_all = "snake_case")]
 pub enum SessionEndReason {
     CtrlC,
-    #[allow(dead_code)]
     CleanExit,
     #[allow(dead_code)]
     Error,
